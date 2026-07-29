@@ -17,6 +17,10 @@ class LLMError(MiraError):
     """Error communicating with an LLM provider."""
 
 
+class NonRetriableLLMError(LLMError):
+    """LLM client error (4xx) that should not be retried."""
+
+
 class ResponseParseError(MiraError):
     """Error parsing or validating LLM response."""
 

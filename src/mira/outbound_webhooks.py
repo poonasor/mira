@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
+import socket
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -87,8 +89,14 @@ class WebhookConfig(BaseModel):
 
 def detect_format(url: str) -> str:
     """Classify a webhook URL as ``"slack"``, ``"teams"`` or ``"generic"``."""
-    host = (urlparse(url).hostname or "").lower()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
     if host == "hooks.slack.com":
+        return "slack"
+    # Discord's Slack-compatible variant (…/webhooks/{id}/{token}/slack).
+    # A bare Discord URL expects Discord's own schema, which Mira doesn't
+    # emit — leave it "generic" so the test button surfaces the 400 loudly.
+    if host in ("discord.com", "discordapp.com") and parsed.path.rstrip("/").endswith("/slack"):
         return "slack"
     # Classic Teams connector (*.webhook.office.com) and the newer Teams
     # Workflows endpoints (Power Automate / Logic Apps, *.logic.azure.com).
@@ -184,24 +192,8 @@ def render(event: str, data: dict[str, Any], fmt: str) -> dict[str, Any]:
 # ── Delivery ─────────────────────────────────────────────────────────────────
 
 
-def is_safe_webhook_url(url: str) -> bool:
-    """Best-effort SSRF guard run before delivery.
-
-    Rejects ``localhost`` and any private / loopback / link-local / reserved IP
-    *literal* so an admin can't point a webhook at internal services or a cloud
-    metadata endpoint (e.g. ``169.254.169.254``). Hostnames are intentionally
-    not resolved — named internal services (e.g. a docker-compose ``mattermost``
-    host) stay usable on self-hosted deployments; this only blocks the obvious
-    raw-IP probe vectors.
-    """
-    host = (urlparse(url).hostname or "").lower()
-    if not host or host == "localhost":
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return True  # not an IP literal — a hostname; allow without resolving
-    return not (
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
         ip.is_private
         or ip.is_loopback
         or ip.is_link_local
@@ -209,6 +201,53 @@ def is_safe_webhook_url(url: str) -> bool:
         or ip.is_multicast
         or ip.is_unspecified
     )
+
+
+def _allowed_hosts() -> set[str]:
+    """Opt-in hostnames trusted without DNS resolution (comma-separated env)."""
+    raw = os.getenv("MIRA_WEBHOOK_ALLOWED_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def is_safe_webhook_url(url: str) -> bool:
+    """Best-effort SSRF guard run before delivery.
+
+    Rejects ``localhost``, any private / loopback / link-local / reserved IP
+    literal, and any *hostname that resolves* into one of those ranges — so an
+    admin can't reach internal services or a cloud metadata endpoint (e.g.
+    ``169.254.169.254``) either directly or via a DNS name pointing there.
+
+    Named internal services (a docker-compose ``mattermost`` host, etc.) no
+    longer pass implicitly; list them in ``MIRA_WEBHOOK_ALLOWED_HOSTS`` to keep
+    them usable on self-hosted deployments.
+
+    Still best-effort: the check resolves the name but the eventual request
+    re-resolves it, leaving a narrow DNS-rebinding window for an admin who also
+    controls a fast-flipping DNS record.
+    """
+    host = (urlparse(url).hostname or "").lower()
+    if not host or host == "localhost":
+        return False
+
+    try:
+        return not _is_blocked_ip(ipaddress.ip_address(host))
+    except ValueError:
+        pass  # not an IP literal — resolve it below
+
+    if host in _allowed_hosts():
+        return True
+
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False  # unresolvable — treat as unsafe rather than send blind
+    for info in infos:
+        try:
+            if _is_blocked_ip(ipaddress.ip_address(info[4][0])):
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 async def deliver_one(

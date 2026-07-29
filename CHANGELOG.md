@@ -4,10 +4,129 @@ All notable changes to Mira are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-07-27
+
+### Added
+
+- **Opt out of per-commit reviews.** `review.review_on_synchronize` (default `true`) controls whether every push to an open PR triggers a fresh review. Turn it off and Mira only reviews when a PR is opened or reopened — later commits are ignored until someone comments `@bot review`. Useful when you batch commits locally before pushing and only want the final diff reviewed, saving tokens and cutting mid-work noise. Honoured on GitHub, GitLab, and Forgejo, and toggleable from the Settings page.
+- **Duplicate-dependency warnings.** A new dependency-review pass flags when a PR adds a package that overlaps in function with one the repo already has (e.g. `react-table` is present and the PR adds `@tanstack/react-table`). It runs on the indexing tier and only when the PR touches a manifest (`package.json`, `pyproject.toml`, `go.mod`, …), so most PRs make no extra LLM call; it compares the added deps against the repo's existing package names from the index (falling back to the manifest diff on an unindexed repo), tags findings `category=dependency`, and merges them into the normal review so they go through the same noise filter and self-critique. Lockfiles are excluded (transitive churn is noise). Gated by `review.dependency_overlap` (default on), admin-toggleable in Settings.
+- **Configurable LLM retry and timeout.** Four new `llm` keys — `max_retries` (3), `request_timeout` (120s), `retry_min_wait` (2s), `retry_max_wait` (30s) — read at runtime instead of being baked in at import time. Raise them for flex-tier models or proxied endpoints that stall under load. Documented in `.mira.yaml.example`.
+- **Concurrent-review de-duplication.** An in-memory review tracker records which PRs are mid-review, so a burst of webhook events (a rapid push + comment, a redelivery) no longer starts overlapping reviews of the same PR — the second attempt is skipped atomically. Review status (`reviewing` / `completed` / `failed`) is wired through the GitHub, GitLab, and Forgejo dispatchers so the dashboard reflects in-flight work.
+
+### Changed
+
+- **LLM retries only fire on transient failures.** The retry predicate is narrowed to timeouts, network errors, and 5xx/429 responses; a 4xx client error now raises `NonRetriableLLMError` and returns immediately instead of burning the full retry budget on a request that can't succeed.
+
+### Security
+
+- **Webhook SSRF via DNS names is closed.** Outbound webhook URLs were only screened for raw private/loopback/metadata *IP literals* — a hostname resolving into one of those ranges slipped through. Delivery now resolves the host and rejects it if any resolved address is private, loopback, link-local, reserved, multicast, or unspecified. Named internal services no longer pass implicitly; allow specific ones with `MIRA_WEBHOOK_ALLOWED_HOSTS` (comma-separated). Unresolvable hosts are treated as unsafe. Still best-effort — a narrow DNS-rebinding window remains for an admin who also controls a fast-flipping record.
+- **No default admin password.** The dashboard no longer ships an `admin` / `admin` account. With `ADMIN_PASSWORD` unset, first start generates a random password and writes it to `<MIRA_INDEX_DIR>/initial_admin_password` (mode `0600`) rather than to logs; if an admin already exists with a well-known default (`admin` / `changeme`), Mira logs a warning to change it. Password storage moves from static-salt SHA-256 to PBKDF2-HMAC-SHA256 (600k iterations, per-user salt, constant-time compare); existing hashes are upgraded on the next successful login.
+- **Several dashboard endpoints were missing auth.** The GitLab/Forgejo sync and repo-register endpoints, model-settings update, uninstall keep/delete, and setup-complete all accepted unauthenticated requests; they now require an admin session.
+- **Public-path auth bypass narrowed.** The auth middleware treated the entire `/api/repos/` prefix and *any* path ending in `.svg` as public (for GitHub badge embedding), exposing more than intended. It now matches only the blast-radius badge (`/api/repos/{owner}/{repo}/blast-radius.svg`) exactly.
+- **Session cookie is marked `Secure` over HTTPS.** The login cookie now sets `Secure` when the request is served over HTTPS (directly or via a trusted `X-Forwarded-Proto`), so it isn't sent over plaintext.
+- **SPA fallback path traversal is closed.** The catch-all static handler resolved `../` sequences before checking the file, so a crafted path could escape the UI dist directory and serve arbitrary files. Resolved paths are now confined to the dist root.
+
+## [0.7.0] — 2026-07-24
+
+### Added
+
+- **Forgejo support — a third first-class git host.** Mira now auto-reviews pull requests on Forgejo (including Codeberg, the default endpoint) with the same pipeline as GitHub and GitLab: inline review comments, walkthroughs, `@mention` commands (`review`, `pause`/`resume`, inline `reject`, free-form questions), push-triggered incremental indexing, and automatic repo discovery at startup. Authentication is an access token — set `MIRA_FORGEJO_TOKEN` + `MIRA_FORGEJO_WEBHOOK_SECRET` and point a webhook at `/forgejo/webhook`; self-hosted instances set `MIRA_FORGEJO_API_URL`. GitHub and GitLab credentials are optional when Forgejo is configured — set any platform, or any combination. See the [Forgejo setup guide](https://docs.miracode.ai/forgejo).
+- **Cross-PR overlap detection.** While reviewing a PR, Mira compares it against the repo's other open PRs and flags the ones stepping on it in the walkthrough — same files (**merge-conflict risk**) or same goal (**duplicate effort**). A cheap deterministic pre-filter (shared files/symbols + title similarity, backed by a per-repo fingerprint cache) runs first, so only genuinely-overlapping candidates cost a single batched LLM call; stacked branches and drafts are excluded, and any failure degrades to "no findings" without blocking the review. Tune or disable under `review.overlap` (`enabled`, `max_candidates`, `confidence_floor`, `title_similarity_threshold`).
+- **PR author allow / deny lists.** `filter.allowed_authors` restricts auto-review to the named authors (empty = review all, the default) and `filter.blocked_authors` always wins over it — handy for muting bots. Matching strips a trailing `[bot]`, so `dependabot` matches `dependabot[bot]`. The dispatcher applies the lists to PR events, `@mention` commands, and push-triggered indexing; an explicit `@miracodeai review` still works on a filtered author's PR.
+- **Review dashboard** — a new admin-only **Review** page focused on keeping a human in the loop on PR reviews: **stale / waiting PRs** (how long open, how long idle, who they're waiting on), a **reviewer-responsiveness leaderboard** that surfaces the bottleneck (pending review queue + median time to respond once requested), **throughput trends** (median time-to-first-review and time-to-merge, this week vs last), an **approved-&-merged** count, **rubber-stamp detection** (approvals with no substantive review — empty/"LGTM" body and no real inline comments — surfaced org-wide and per reviewer), and an **open-PR status board** (approved / changes-requested / awaiting). Review timing is captured live from webhooks (`pull_request_review`, review-requested) and seeded by a light GitHub backfill of open PRs + existing reviews on repo add / admin **Refresh** / the `mira backfill-contributors` CLI.
+- **Contribution analytics (secondary)** — each contributor's detail page also shows authoring stats (commits, PRs opened/merged, lines), a GitHub-style year-long contribution heatmap, and Mira's differentiated **review-quality** signal (blockers/warnings their PRs triggered + the accept rate of Mira's feedback). Contributors are keyed provider-agnostically `(provider, login)` so non-GitHub providers can be added later.
+- **Threaded PR activity timeline.** Mira now stores each review's comments and the human replies to them, and the dashboard's Activity detail renders the exchange as threaded conversations grouped under each review pass — replies nested under the exact Mira comment they answer, severity dots aligned to file lines, newest first.
+- A reusable **DataTable** component (column defs, header sorting, standalone pagination, loading/empty states) plus an inline 5-bar **gauge**, both used across the review pages.
+
+### Fixed
+
+- **Review comments always anchor to the PR's own diff.** Two related round-2 bugs: a merge commit's incremental diff dragged in everything the base branch had merged (so Mira reviewed — and spent tokens on — code that wasn't the PR's), and findings on such mainline code produced inline comments GitHub rejects (422: line not in the PR diff), leaving orphaned 🔴 rows in the review's Key Issues table with no inline comment attached. Incremental diffs are now restricted to the PR's own files, unanchorable comments are dropped before posting, and the Key Issues table is re-synced to what actually posts.
+- **Postgres writes for review comments and PR replies survive stale connections** — two write paths missed by 0.6.0's reconnecting-cursor fix now route through it instead of crashing on an idle-dropped connection.
+- **Long learned-rule text truncates with an ellipsis** in the dashboard's pending-learnings card instead of overflowing the table.
+
+## [0.6.0] — 2026-07-10
+
+### Added
+
+- **GitLab support — full parity with GitHub.** Mira now auto-reviews merge requests via webhooks, posts inline review comments anchored to diff positions (with a plain-note fallback when GitLab rejects a position), and answers `@mention` commands on MRs: `review`, `review-rest`, `pause`/`resume`, inline `reject`, free-form questions, and merge-time learning. Round 2+ incremental re-review, thread auto-resolution once a finding is fixed, JIT cross-file context, file-history context, codebase indexing, incremental push indexing, and vulnerability/package search all work the same as on GitHub. Authentication is a group or project access token — set `MIRA_GITLAB_TOKEN` + `MIRA_GITLAB_WEBHOOK_SECRET` and point a project webhook at `/gitlab/webhook`; self-managed instances set `MIRA_GITLAB_API_URL`. GitHub App credentials are now optional when GitLab is configured (set either, or both). See the [GitLab setup guide](https://docs.miracode.ai/gitlab).
+- **Dynamic platform layer.** Adding a git host is now data, not code: a `platforms.json` registry (mirroring `providers.json` for LLMs) carries each platform's API URL, webhook route, signature scheme, and terminology, overridable at runtime via `MIRA_PLATFORMS_JSON_PATH`. The repo data model extends to `(platform, owner, repo)`, so same-named repos coexist across hosts; existing GitHub rows migrate automatically with `platform = github`.
+- **Mira answers to both its handles.** On either platform, a mention of the configured `MIRA_BOT_NAME` *or* the bot's real account username (GitHub App slug / GitLab token user) triggers a command — whichever a teammate types.
+
+### Changed
+
+- **Review comment headers use one severity marker instead of two emojis.** The category line is now plain bold text (`**Security issue**`) above the severity badge, rather than a second leading emoji. Cleaner, still scannable, and it renders correctly on both GitHub and GitLab (GitLab needed a Markdown hard break where GitHub tolerated a bare newline).
+
+### Fixed
+
+- **Malformed LLM JSON is recovered instead of dropped.** Responses that leak Anthropic tool-call XML (`</parameter></invoke>`) or arrive with an unbalanced brace are now repaired before parsing, so a chunk's comments are no longer lost when a model's output strays from clean JSON. Affects both the main and security passes.
+- **Stale PostgreSQL connections after idle** — `AppDatabase` and `pg_store` keep
+  long-lived psycopg handles that can go dead behind poolers or `idle_session_timeout`.
+  A new `mira.db.postgres` module adds `ReconnectingCursor`, which retries once on
+  `OperationalError` for `execute` and `executemany` (covering dashboard API routes,
+  indexing, and the vulnerability poller) without adding per-query liveness probes.
+- **`/health` reflects Postgres availability** — when `DATABASE_URL` is Postgres,
+  the endpoint runs a one-shot `SELECT 1` on a dedicated connection that is always
+  closed afterward, and returns HTTP 503 if the database is unreachable.
+- **Creating or editing a learning requires authentication** — the learned-rule
+  create and update endpoints now return 401 for unauthenticated requests instead
+  of proceeding with an anonymous author.
+- **Dashboard setup and repo sync respect a repo's platform** — completing setup
+  writes index mode and status to the correct `(platform, owner, repo)` row (GitLab
+  repos could previously not be opted out of initial indexing), and the GitHub repo
+  sync no longer targets GitLab rows when pruning stale repos.
+
+## [0.5.1] — 2026-07-09
+
+### Fixed
+
+- **One malformed walkthrough entry no longer drops the whole walkthrough** — when the LLM omits a required `path` or `label` on a single `change_groups` entry (plausible on large diffs), that entry is now skipped with a warning instead of failing the entire response, so the walkthrough comment still posts. Closes #162.
+- **The walkthrough placeholder is always finalized** — when a review produces no walkthrough (all files matched exclusion rules, empty diff, size limits, or walkthrough generation failed), the "Reviewing this PR…" placeholder comment is now updated with the reason instead of staying stuck forever. Part of #162.
+
+## [0.5.0] — 2026-07-07
+
+### Added
+
+- **Learnings approval queue** — auto-synthesized learnings now land as *pending* and must be approved by an admin before they influence reviews. Approve or reject from a queue-clearing side panel or straight from the dashboard's pending-learnings widget.
+- **Anyone can propose a learning** — non-admin submissions are created as pending; creators can edit or delete their own pending learnings while admins manage everything. Learnings track their author and show an avatar + username.
+- **Learnings page overhaul** — dedicated add/edit page (replacing the modal), sortable and paginated table (recently-updated first), repo/status/enabled filters with search, URL-driven tabs so browser Back works, and GitHub links per repo.
+- **Newest frontier models in the registry** — Claude Sonnet 5, Claude Opus 4.8, Claude Fable 5, GPT-5.2, Gemini 3.1 Pro Preview, DeepSeek V4 Flash/Pro, and MiniMax M3, with pricing and ids verified against the live OpenRouter catalog.
+
+### Changed
+
+- **Superseded registry entries removed** — GPT-4o and GPT-4o mini, GPT-4.1 Mini, Gemini 2.5 Flash/Pro, MiniMax M2.7, and the OpenRouter Claude Opus 4.6 id (the Bedrock profile remains). Deployments still configured with these keep working — the dashboard accepts any id the configured backend serves; they just lose curated pricing metadata.
+- **Recommended defaults unchanged** — Claude Sonnet 4.6 for reviews and Claude Haiku 4.5 for indexing were benchmarked on the review-quality baseline and keep the badge until a newer model measurably beats them.
+
+### Fixed
+
+- **Dark mode dropdown contrast** — popovers and select menus use an elevated surface color instead of blending invisibly into the card behind them.
+- **Pending learnings are private** — the learned-rule detail endpoint requires authentication and returns 403 when a non-admin reads someone else's pending/rejected learning.
+- The learnings panel advances to the next pending item only after the approve/reject call resolves.
+- Database inserts that fail to produce a row id now raise instead of silently returning id 0 (learned rules, feedback events).
+- The learned-rules API client URL-encodes the status query parameter.
+
+## [0.4.1] — 2026-07-06
+
+### Added
+
+- **Activity page** — an org-wide feed of PR reviews with a filterable table and a per-PR detail timeline. (#145, #146, #147 — already in the 0.4.1 betas.)
+- **Backend-aware, searchable model pickers** — the dashboard's model dropdowns are now search bars that list the configured backend's live catalog (OpenRouter's tool-capable models, your Bedrock account's inference profiles, or a generic endpoint's `/models`), cached for an hour with the bundled registry as fallback. Any free-form model id can be typed directly, matching `mira.yaml`'s flexibility, and an **Inherit from deployment config** choice clears the dashboard override so `mira.yaml` is authoritative again. The effective model and its source (`dashboard setting` vs `mira.yaml`) are logged on every review, so an override is never silent. Closes #124.
+- **Current-generation models in the registry** — GPT-5 Nano/Mini, GPT-5.1 Codex/Codex Mini, GPT-4.1 Mini, Gemini 3 Flash (Preview), and Gemini 3.1 Flash Lite, with pricing verified against the live OpenRouter catalog. Closes #125.
+
+### Changed
+
+- **`llm.base_url` is validated at config load** — non-http(s) schemes are rejected, and plain `http://` is allowed only for local endpoints (localhost, private IPs, dotless hostnames like docker-compose services); public hosts must use `https://`. A failed API-key lookup during a model-catalog fetch is now logged instead of silently sending an unauthenticated request.
+
+### Fixed
+
+- **Discord webhooks work via the Slack-compatible endpoint** — a `discord.com/api/webhooks/{id}/{token}/slack` URL is now detected as Slack format instead of falling through to generic JSON (which Discord rejects). Bare Discord URLs stay generic on purpose, so the test button surfaces the mismatch instead of silently guessing. Closes #158.
+- **Dependency-bump pushes refresh the vulnerability inventory** — push-triggered incremental indexing skipped manifests/lockfiles entirely (they're excluded from code indexing), so merging a lockfile-only PR left `package_manifests` stale and the Vulnerabilities page kept flagging already-fixed advisories until a full re-index. `index_diff` now routes changed/removed manifests through the same parse-and-store pass the full indexer uses and fires an immediate OSV poll. Closes #157.
+- **Global rules now reach reviews on Postgres deployments** — the review engine read global rules from a throwaway SQLite `AppDatabase()` instead of the configured `DATABASE_URL` backend, so dashboard-stored rules were silently ignored, a stray `_app.db` (with a default-password admin) was created in the index dir, and a DB connection leaked on every review. It now reuses the server's configured instance. Closes #123.
+
 ## [0.4.0] — 2026-06-14
 
 ### Added
 
+- **Provider profiles — adding an LLM provider is now data, not code.** The OpenAI-compatible client's per-provider quirks (attribution headers, whether the model id keeps its `vendor/` prefix, reasoning-effort remapping, default key env var) moved out of hardcoded `if openrouter` branches into a declarative `providers.json`, matched to the configured `base_url`. OpenRouter's quirks are now a single profile entry rather than code branches; any endpoint with no matching profile gets the portable default (bare model name, no extra headers), so most OpenAI-compatible providers work with nothing but `base_url` + `api_key_env`. Extend or override the bundled list at runtime by pointing `MIRA_PROVIDERS_JSON_PATH` at your own file — same idiom as `MIRA_MODELS_JSON_PATH` for models. No behaviour change for existing configs.
 - **`exclude_files` apply to indexing** — `filter.exclude_patterns` now governs the index as well as review, so committed vendor dirs, generated SDKs, and test data can be kept out of indexing without burning tokens on them. The same globs that exclude a file from review exclude it from indexing; the dashboard's per-repo file count reflects the exclusions too. Closes #97.
 - **Indexing file-size limit** — new `index.max_file_size` (bytes, default 1 MB) skips any file above the limit before it reaches the summarizer. Lower it to keep indexing cheap on large codebases with big fixtures or generated files; `0` disables the limit. Replaces the previous hard-coded 1 MB tarball cap and now also covers the per-file fetch path. Closes #98.
 
@@ -179,6 +298,10 @@ Initial public release.
 - `handle_push_index` now updates `updated_at` after incremental re-indexing
   so the "Indexed X ago" timestamp tracks reality.
 
+[0.6.0]: https://github.com/miracodeai/mira/releases/tag/v0.6.0
+[0.5.1]: https://github.com/miracodeai/mira/releases/tag/v0.5.1
+[0.5.0]: https://github.com/miracodeai/mira/releases/tag/v0.5.0
+[0.4.1]: https://github.com/miracodeai/mira/releases/tag/v0.4.1
 [0.4.0]: https://github.com/miracodeai/mira/releases/tag/v0.4.0
 [0.3.1]: https://github.com/miracodeai/mira/releases/tag/v0.3.1
 [0.3.0]: https://github.com/miracodeai/mira/releases/tag/v0.3.0

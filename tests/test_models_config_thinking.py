@@ -14,12 +14,20 @@ import pytest
 from fastapi import HTTPException
 
 from mira.config import LLMConfig
-from mira.dashboard.api import ModelsUpdate, set_models
+from mira.dashboard.api import ModelsUpdate
 from mira.dashboard.db import AppDatabase
 from mira.dashboard.models_config import (
     get_review_thinking_mode,
     llm_config_for,
 )
+from mira.dashboard.routers.admin import set_models
+
+
+def _admin_req():
+    from types import SimpleNamespace
+
+    user = SimpleNamespace(is_admin=True)
+    return SimpleNamespace(state=SimpleNamespace(user=user))
 
 
 @pytest.fixture
@@ -79,7 +87,7 @@ class TestSetModelsThinkingValidation:
             review_thinking_mode="ultra",
         )
         with pytest.raises(HTTPException) as exc:
-            set_models(body)
+            set_models(body, _admin_req())
         assert exc.value.status_code == 400
 
     def test_persists_valid_thinking_mode(self, in_memory_db: AppDatabase):
@@ -88,7 +96,7 @@ class TestSetModelsThinkingValidation:
             review_model="anthropic/claude-sonnet-4-6",
             review_thinking_mode="medium",
         )
-        assert set_models(body) == {"ok": True}
+        assert set_models(body, _admin_req()) == {"ok": True}
         assert in_memory_db.get_setting("review_thinking_mode") == "medium"
 
     def test_off_clears_setting_so_config_can_win(self, in_memory_db: AppDatabase):
@@ -99,7 +107,7 @@ class TestSetModelsThinkingValidation:
             review_model="anthropic/claude-sonnet-4-6",
             review_thinking_mode="off",
         )
-        assert set_models(body) == {"ok": True}
+        assert set_models(body, _admin_req()) == {"ok": True}
         assert in_memory_db.get_setting("review_thinking_mode") == ""
         cfg = LLMConfig(review_reasoning_effort="high")
         assert (

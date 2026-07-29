@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from mira.exceptions import ConfigError
 
@@ -18,6 +20,18 @@ logger = logging.getLogger(__name__)
 # is accepted for backward compat with repos that committed it before the
 # 0.1.1 standardization on the .yaml extension.
 _DEFAULT_CONFIG_FILENAMES = (".mira.yaml", ".mira.yml")
+
+
+def _is_local_host(host: str) -> bool:
+    """Loopback, private/link-local IP literals, and dotless hostnames
+    (docker-compose services) — where a plain-http endpoint is legitimate."""
+    if host == "localhost" or "." not in host:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
 class LLMConfig(BaseModel):
@@ -48,6 +62,26 @@ class LLMConfig(BaseModel):
     # (env vars, instance profile, ECS task role, SSO).
     region: str = "us-east-1"
     aws_profile: str | None = None
+    # Retry and timeout configuration for LLM calls.
+    # Defaults match the previous hardcoded values to preserve existing behavior.
+    max_retries: int = Field(default=3, ge=1)
+    request_timeout: int = Field(default=120, ge=1)
+    retry_min_wait: int = Field(default=2, ge=0)
+    retry_max_wait: int = Field(default=30, ge=0)
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(f"llm.base_url must be an http(s) URL, got {v!r}")
+        if parsed.scheme == "http" and not _is_local_host(parsed.hostname):
+            raise ValueError(
+                f"llm.base_url {v!r} uses plain http to a public host — use https "
+                "(http is allowed only for localhost, private IPs, and dotless "
+                "hostnames like docker-compose services)"
+            )
+        return v
 
 
 class FilterConfig(BaseModel):
@@ -88,6 +122,35 @@ class FilterConfig(BaseModel):
     )
     exclude_deleted: bool = True
     max_files: int = 50
+    # Only auto-review PRs whose author (payload `sender.login` /
+    # `user.username`) is in this list. Empty list = review all (default).
+    # Bot-self events are always excluded regardless of this list.
+    allowed_authors: list[str] = Field(default_factory=list)
+    # Never auto-review PRs from these authors. Takes precedence over
+    # allowed_authors. A trailing `[bot]` suffix on the payload login is
+    # stripped by the dispatcher check so that `dependabot` here matches
+    # `dependabot[bot]` in a webhook payload.
+    blocked_authors: list[str] = Field(default_factory=list)
+
+
+class OverlapConfig(BaseModel):
+    """Cross-PR overlap detection ("stepping on each other's toes").
+
+    While reviewing a PR, Mira compares it against other open PRs in the repo
+    and flags ones that touch the same code (merge-conflict risk) or pursue the
+    same goal (duplicate effort). A cheap deterministic pre-filter runs first;
+    only the survivors cost an LLM call.
+    """
+
+    enabled: bool = True
+    # Cap on how many recently-updated open PRs to compare against, to bound
+    # GitHub API calls and LLM cost on busy repos.
+    max_candidates: int = Field(default=20, ge=1, le=100)
+    # Verdicts below this confidence are dropped (LLM-scored, 0..1).
+    confidence_floor: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Pre-filter keeps a candidate with no shared files/symbols only if its
+    # title is at least this Jaccard-similar — the duplicate-effort lane.
+    title_similarity_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
 
 
 class ReviewConfig(BaseModel):
@@ -95,7 +158,7 @@ class ReviewConfig(BaseModel):
     # Total diff size cap. Above this, the diff is *not* truncated arbitrarily —
     # files are ranked by priority and the lowest-priority files are skipped
     # until the diff fits. Skipped files are listed in the walkthrough so the
-    # user can invoke `@mira-bot review-rest` to review them.
+    # user can invoke `@miracodeai review-rest` to review them.
     max_diff_size: int = 250_000
     # Per-file size cap. A single huge file (lockfile, generated SDK, etc.)
     # gets skipped before chunking even starts.
@@ -160,6 +223,28 @@ class ReviewConfig(BaseModel):
     # skip the relationship-store lookup and trim the walkthrough.
     blast_radius: bool = True
 
+    # Warn when a PR adds a dependency that duplicates the functionality of one
+    # already in the repo (e.g. a second table or HTTP-client library). Runs a
+    # dedicated indexing-tier pass, but only when the PR changes a manifest file
+    # (package.json, pyproject.toml, go.mod, …) — no LLM call otherwise.
+    dependency_overlap: bool = True
+
+    # Cross-PR overlap detection — flag other open PRs that step on this one
+    # (same files = merge-conflict risk, or same goal = duplicate effort).
+    overlap: OverlapConfig = Field(default_factory=OverlapConfig)
+
+    # Automatically resolve bot review threads that the LLM verifies as fixed
+    # on each review pass. Disable to leave all bot comments open until a human
+    # resolves them (user-initiated reject/resolve replies still work).
+    auto_resolve_conversations: bool = True
+
+    # Auto-review on every push (`synchronize` event). When False, Mira only
+    # reviews when the PR is opened or reopened. Subsequent commits are
+    # ignored unless you comment `@bot_name review` to trigger a manual pass.
+    # Disabling this saves tokens and reduces noise when you batch commits
+    # locally before pushing — only the final diff gets reviewed.
+    review_on_synchronize: bool = True
+
 
 class IndexConfig(BaseModel):
     # Skip indexing any file larger than this (bytes). Generated SDKs, vendored
@@ -175,7 +260,9 @@ class ProviderConfig(BaseModel):
 
 class DatabaseConfig(BaseModel):
     url: str = ""  # empty = SQLite fallback. "postgresql://user:pass@host:5432/mira"
-    admin_password: str = "admin"  # default admin password, change in production
+    admin_password: str = (
+        ""  # initial admin password; empty = generated on first start, written to a 0600 file
+    )
 
 
 class MiraConfig(BaseModel):

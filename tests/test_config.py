@@ -25,6 +25,43 @@ def _reset_global_defaults(monkeypatch: pytest.MonkeyPatch):
         mira_config._global_defaults = saved
 
 
+class TestBaseUrlValidation:
+    """base_url is trusted deployment input, but obvious misconfigurations
+    (non-http schemes, plain http to a public host) fail loudly at load."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://openrouter.ai/api/v1",
+            "https://api.together.xyz/v1",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8000/v1",
+            "http://ollama:11434/v1",
+            "http://10.0.0.5:8000/v1",
+        ],
+    )
+    def test_accepted(self, url):
+        from mira.config import LLMConfig
+
+        assert LLMConfig(base_url=url).base_url == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://openrouter.ai/api/v1",
+            "file:///etc/passwd",
+            "openrouter.ai/api/v1",
+            "",
+            "http://api.example.com/v1",
+        ],
+    )
+    def test_rejected(self, url):
+        from mira.config import LLMConfig
+
+        with pytest.raises(ValueError):
+            LLMConfig(base_url=url)
+
+
 class TestLoadConfig:
     def test_default_config(self):
         config = load_config()
@@ -35,6 +72,29 @@ class TestLoadConfig:
         assert config.review.walkthrough is True
         assert config.review.walkthrough_sequence_diagram is True
         assert config.index.max_file_size == 1_048_576
+
+    def test_llm_retry_timeout_defaults(self):
+        from mira.config import LLMConfig
+
+        c = LLMConfig()
+        assert c.max_retries == 3
+        assert c.request_timeout == 120
+        assert c.retry_min_wait == 2
+        assert c.retry_max_wait == 30
+
+    def test_llm_retry_timeout_override(self):
+        from mira.config import LLMConfig
+
+        c = LLMConfig(
+            max_retries=5,
+            request_timeout=300,
+            retry_min_wait=5,
+            retry_max_wait=60,
+        )
+        assert c.max_retries == 5
+        assert c.request_timeout == 300
+        assert c.retry_min_wait == 5
+        assert c.retry_max_wait == 60
 
     def test_focus_only_on_problems_override(self, sample_config_path: Path):
         config = load_config(
