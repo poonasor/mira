@@ -460,8 +460,13 @@ async def index_repo(
     # (e.g. for a >100 MB repo where GitHub may reject the request).
     max_file_size = config.index.max_file_size
     fetch_sem = asyncio.Semaphore(_FILE_FETCH_SEMAPHORE)
+    indexable_set = set(indexable)
     tarball: dict[str, str] | None = await fetcher.repo_tarball(
-        owner, repo, branch, max_file_size=max_file_size
+        owner,
+        repo,
+        branch,
+        max_file_size=max_file_size,
+        indexable_paths=indexable_set,
     )
 
     if tarball is not None:
