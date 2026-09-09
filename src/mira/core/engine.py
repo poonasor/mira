@@ -21,6 +21,7 @@ from mira.core.file_filter import filter_files
 from mira.core.noise_filter import drop_already_posted, filter_noise
 from mira.core.passes import (
     agentic_review_loop,
+    cap_review_summary,
     dependency_review_pass,
     regenerate_summary,
     security_review_pass,
@@ -59,6 +60,7 @@ from mira.models import (
     build_review_stats,
 )
 from mira.providers.base import BaseProvider
+from mira.security.secrets_scan import scan_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -1333,6 +1335,12 @@ class ReviewEngine:
                     # majority-vote findings. The agentic loop (if any) only
                     # runs once; extras sample the plain review path.
                     n_runs = self.config.review.ensemble_runs
+                    if n_runs > 1 and not getattr(self.llm, "supports_temperature", True):
+                        logger.warning(
+                            "Provider does not support temperature controls; "
+                            "disabling ensemble runs"
+                        )
+                        n_runs = 1
                     if n_runs > 1:
                         extra_raws = await _asyncio.gather(
                             *[
@@ -1385,6 +1393,23 @@ class ReviewEngine:
                     return [], [], ""
 
         review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
+        # Per-chunk executors (fresh per call) so each chunk gets its own
+        # 50KB tool-output budget; one shared executor would let an early
+        # chunk exhaust the budget and wedge later chunks.
+        _security_executor_factory = None
+        if (
+            self.config.review.security_agentic
+            and self.config.review.agentic_tools
+            and self._agentic_source_fetcher is not None
+        ):
+            from mira.llm.agentic_tools import AgenticToolExecutor
+
+            def _security_executor_factory() -> AgenticToolExecutor:
+                return AgenticToolExecutor(
+                    source_fetcher=self._agentic_source_fetcher,
+                    repo_tree=list(self._agentic_repo_tree),
+                )
+
         security_task = _asyncio.create_task(
             security_review_pass(
                 self.llm,
@@ -1392,6 +1417,7 @@ class ReviewEngine:
                 _security_relevant_files(filtered),
                 pr_title,
                 security_llm=self.security_llm,
+                agentic_executor_factory=_security_executor_factory,
             )
             if self.config.review.security_pass
             else _asyncio.sleep(0, result=[])
@@ -1445,8 +1471,20 @@ class ReviewEngine:
             else _asyncio.sleep(0, result=[])
         )
 
-        chunk_results, security_comments, dependency_comments, osv_comments = await _asyncio.gather(
-            review_task, security_task, dependency_task, osv_task
+        secrets_task = _asyncio.create_task(
+            scan_secrets(filtered)
+            if filtered and self.config.review.secrets_scan
+            else _asyncio.sleep(0, result=[])
+        )
+
+        (
+            chunk_results,
+            security_comments,
+            dependency_comments,
+            osv_comments,
+            secrets_comments,
+        ) = await _asyncio.gather(
+            review_task, security_task, dependency_task, osv_task, secrets_task
         )
 
         all_comments: list[ReviewComment] = []
@@ -1464,6 +1502,8 @@ class ReviewEngine:
         all_comments.extend(dependency_comments)
         audit.append({"stage": "drafted", "chunk": "osv", "count": len(osv_comments)})
         all_comments.extend(osv_comments)
+        audit.append({"stage": "drafted", "chunk": "secrets", "count": len(secrets_comments)})
+        all_comments.extend(secrets_comments)
 
         all_comments = [classify_severity(c) for c in all_comments]
 
@@ -1529,6 +1569,7 @@ class ReviewEngine:
             except Exception as exc:
                 logger.warning("Summary regeneration failed, using original: %s", exc)
                 summary = original_summary or "No issues found."
+            summary = cap_review_summary(summary)
         else:
             summary = ""
 

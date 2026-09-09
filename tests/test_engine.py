@@ -2049,6 +2049,43 @@ class TestRegenerateSummary:
         )
         assert out == "fallback"
 
+    @pytest.mark.asyncio
+    async def test_caps_generated_summary_and_output_tokens(self, monkeypatch):
+        """Runaway model output is bounded before it can reach a provider."""
+        from mira.core.passes import regenerate_summary
+        from mira.llm import provider as provider_mod
+
+        async def fake_complete(self, messages, json_mode=True, temperature=None, max_tokens=None):
+            assert max_tokens == 512
+            return "word " * 1_000
+
+        monkeypatch.setattr(provider_mod.LLMProvider, "complete", fake_complete)
+
+        out = await regenerate_summary(
+            AsyncMock(), [self._comment()], [], "t", "d", fallback="fallback"
+        )
+
+        assert len(out) <= 2_000
+        assert out.endswith("… [summary truncated]")
+
+    @pytest.mark.asyncio
+    async def test_caps_fallback_after_llm_failure(self, monkeypatch):
+        """The fallback path has the same hard character limit."""
+        from mira.core.passes import regenerate_summary
+        from mira.llm import provider as provider_mod
+
+        async def fake_complete(self, messages, json_mode=True, temperature=None, max_tokens=None):
+            raise RuntimeError("LLM down")
+
+        monkeypatch.setattr(provider_mod.LLMProvider, "complete", fake_complete)
+
+        out = await regenerate_summary(
+            AsyncMock(), [self._comment()], [], "t", "d", fallback="fallback " * 1_000
+        )
+
+        assert len(out) <= 2_000
+        assert out.endswith("… [summary truncated]")
+
 
 class TestDropOrphanKeyIssues:
     """Key Issues table must stay in sync with surviving inline comments."""
@@ -2342,3 +2379,221 @@ class TestAgenticToolsOnIndexedRepos:
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert engine._agentic_source_fetcher is None
+
+
+class TestAgenticSecurityPass(TestAgenticToolsOnIndexedRepos):
+    """Security pass runs the agentic loop when enabled; one-shot when it bails."""
+
+    _SECURITY_FILE_DIFF = FileDiff(
+        path="src/auth.py",
+        change_type=FileChangeType.MODIFIED,
+        language="python",
+        added_lines=3,
+        deleted_lines=0,
+        hunks=[
+            SimpleNamespace(
+                target_start=1,
+                target_length=4,
+                content=" x = 0\n+y = 1\n+if y == SECRET:\n+    login()\n",
+            )
+        ],
+    )
+
+    _SECURITY_CANNED = json.dumps(
+        {
+            "comments": [
+                {
+                    "path": "src/auth.py",
+                    "line": 2,
+                    "severity": "blocker",
+                    "category": "security",
+                    "title": "Hardcoded secret",
+                    "body": "Do not hardcode the auth token.",
+                    "confidence": 0.9,
+                }
+            ],
+            "summary": "s",
+            "metadata": {"reviewed_files": 1},
+        }
+    )
+
+    async def _engine_with_index(self, monkeypatch, tmp_path, **config_overrides):
+        from mira.config import MiraConfig
+        from mira.core.engine import ReviewEngine
+        from mira.index.store import FileSummary, IndexStore
+
+        monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+
+        store = IndexStore.open("test", "repo")
+        store.upsert_summary(
+            FileSummary(path="src/a.py", language="python", summary="Module a", content_hash="h")
+        )
+        store.close()
+
+        config = MiraConfig()
+        config.review.agentic_tools = True
+        config.review.code_context = True
+        config.review.self_critique = False
+        for key, value in config_overrides.items():
+            setattr(config.review, key, value)
+
+        mock_llm = MagicMock()
+        mock_llm.review = AsyncMock(return_value="{}")
+        mock_llm.count_tokens = MagicMock(return_value=100)
+        mock_llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=self._make_provider())
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_security_agentic_factory_built(self, monkeypatch, tmp_path):
+        """security_agentic on (default) + live fetcher → pass gets a factory
+        that yields per-chunk AgenticToolExecutor instances."""
+        from mira.core import engine as engine_mod
+        from mira.llm.agentic_tools import AgenticToolExecutor
+
+        seen: dict = {}
+
+        async def fake_sec_pass(llm, files, narrowed, pr_title="", **kw):
+            seen.update(kw)
+            return []
+
+        monkeypatch.setattr(engine_mod, "security_review_pass", fake_sec_pass)
+
+        engine = await self._engine_with_index(
+            monkeypatch, tmp_path, security_pass=True, security_agentic=True
+        )
+
+        assert engine._agentic_source_fetcher is not None
+        factory = seen["agentic_executor_factory"]
+        assert callable(factory)
+
+        exec1, exec2 = factory(), factory()
+        assert isinstance(exec1, AgenticToolExecutor)
+        assert isinstance(exec2, AgenticToolExecutor)
+        assert exec1 is not exec2, "factory must yield a fresh executor per chunk"
+        assert exec1.source_fetcher is engine._agentic_source_fetcher
+        assert exec1.repo_tree == list(engine._agentic_repo_tree)
+        assert seen["security_llm"] is engine.security_llm
+
+    @pytest.mark.asyncio
+    async def test_security_agentic_off_no_factory(self, monkeypatch, tmp_path):
+        """security_agentic=False → factory stays None even with a live fetcher."""
+        from mira.core import engine as engine_mod
+
+        seen: dict = {}
+
+        async def fake_sec_pass(llm, files, narrowed, pr_title="", **kw):
+            seen.update(kw)
+            return []
+
+        monkeypatch.setattr(engine_mod, "security_review_pass", fake_sec_pass)
+
+        engine = await self._engine_with_index(
+            monkeypatch, tmp_path, security_pass=True, security_agentic=False
+        )
+
+        assert engine._agentic_source_fetcher is not None
+        assert seen["agentic_executor_factory"] is None
+
+    @pytest.mark.asyncio
+    async def test_agentic_loop_used_when_factory_given(self, monkeypatch):
+        """With a factory, the agentic loop runs on the security tier and the
+        one-shot fallback is never attempted."""
+        from mira.core.passes import security_review_pass
+
+        loop_mock = AsyncMock(return_value=self._SECURITY_CANNED)
+        monkeypatch.setattr("mira.core.passes.agentic_review_loop", loop_mock)
+
+        sec_llm = MagicMock(spec=LLMProvider)
+        sec_llm.count_tokens = MagicMock(return_value=100)
+        sec_llm.complete_with_tools = AsyncMock(
+            side_effect=AssertionError("one-shot fallback must not run when the loop submits")
+        )
+        main_llm = MagicMock(spec=LLMProvider)
+        main_llm.complete_with_tools = AsyncMock(
+            side_effect=AssertionError("one-shot fallback must not run when the loop submits")
+        )
+
+        with patch("mira.core.passes.load_config") as mock_cfg:
+            mock_cfg.return_value = MiraConfig()
+            out = await security_review_pass(
+                main_llm,
+                [self._SECURITY_FILE_DIFF],
+                [self._SECURITY_FILE_DIFF],
+                "title",
+                security_llm=sec_llm,
+                agentic_executor_factory=lambda: MagicMock(),
+            )
+
+        loop_mock.assert_awaited_once()
+        provider = loop_mock.call_args[0][0]
+        assert provider is sec_llm, "loop must run on the security-tier provider"
+        main_llm.complete_with_tools.assert_not_called()
+        assert out
+        assert all(c.source_pass == "security" and c.category == "security" for c in out)
+
+    @pytest.mark.asyncio
+    async def test_loop_bails_falls_back_to_one_shot(self, monkeypatch):
+        """Loop bails (returns "") → one-shot security-tier call is the floor
+        and its comments still come back tagged security."""
+        from mira.core.passes import security_review_pass
+
+        loop_mock = AsyncMock(return_value="")
+        monkeypatch.setattr("mira.core.passes.agentic_review_loop", loop_mock)
+
+        llm = MagicMock(spec=LLMProvider)
+        llm.count_tokens = MagicMock(return_value=100)
+        llm.complete_with_tools = AsyncMock(return_value=self._SECURITY_CANNED)
+
+        with patch("mira.core.passes.load_config") as mock_cfg:
+            mock_cfg.return_value = MiraConfig()
+            out = await security_review_pass(
+                llm,
+                [self._SECURITY_FILE_DIFF],
+                [self._SECURITY_FILE_DIFF],
+                "title",
+                security_llm=llm,
+                agentic_executor_factory=lambda: MagicMock(),
+            )
+
+        loop_mock.assert_awaited_once()
+        llm.complete_with_tools.assert_called_once()
+        assert len(out) == 1
+        assert out[0].source_pass == "security"
+        assert out[0].category == "security"
+
+    @pytest.mark.asyncio
+    async def test_loop_raises_falls_back_to_one_shot(self, monkeypatch):
+        """If the loop ever raises (executor bug, uncaught tool error), the
+        exception must be contained and the one-shot retry path must still
+        run — the pass must never propagate into the main review."""
+        from mira.core.passes import security_review_pass
+
+        loop_mock = AsyncMock(side_effect=RuntimeError("executor blew up"))
+        monkeypatch.setattr("mira.core.passes.agentic_review_loop", loop_mock)
+
+        sec_llm = MagicMock(spec=LLMProvider)
+        sec_llm.count_tokens = MagicMock(return_value=100)
+        sec_llm.complete_with_tools = AsyncMock(side_effect=RuntimeError("security tier down"))
+        main_llm = MagicMock(spec=LLMProvider)
+        main_llm.complete_with_tools = AsyncMock(return_value=self._SECURITY_CANNED)
+
+        with patch("mira.core.passes.load_config") as mock_cfg:
+            mock_cfg.return_value = MiraConfig()
+            # Must return, not raise — and land on the fallback-LLM retry.
+            out = await security_review_pass(
+                main_llm,
+                [self._SECURITY_FILE_DIFF],
+                [self._SECURITY_FILE_DIFF],
+                "title",
+                security_llm=sec_llm,
+                agentic_executor_factory=lambda: MagicMock(),
+            )
+
+        loop_mock.assert_awaited_once()
+        sec_llm.complete_with_tools.assert_called_once()
+        main_llm.complete_with_tools.assert_called_once()
+        assert len(out) == 1
+        assert out[0].source_pass == "security"
