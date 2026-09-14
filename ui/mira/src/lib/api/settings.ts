@@ -1,5 +1,20 @@
 import { fetchJson, putJson } from "./http"
 
+export type FailoverTier = {
+  tier: number
+  backend: string
+  review_model: string
+  indexing_model: string
+  cooldown_remaining_seconds: number
+}
+
+export type FailoverStatus = {
+  enabled: boolean
+  cooldown_seconds: number
+  primary_max_retries: number
+  tiers: FailoverTier[]
+}
+
 // Model selection, cost estimate, and admin review-config overrides.
 export const settingsApi = {
   getModels: () =>
@@ -20,7 +35,11 @@ export const settingsApi = {
         recommended?: boolean
       }[]
       review_options: { value: string; label: string; recommended?: boolean }[]
-      security_options: { value: string; label: string; recommended?: boolean }[]
+      security_options: {
+        value: string
+        label: string
+        recommended?: boolean
+      }[]
       review_thinking_mode: string
       thinking_options: {
         value: string
@@ -34,6 +53,8 @@ export const settingsApi = {
         recommended?: boolean
       }[]
     }>("/api/settings/models"),
+
+  getFailoverStatus: () => fetchJson<FailoverStatus>("/api/settings/failover"),
 
   saveModels: (
     indexing_model: string,

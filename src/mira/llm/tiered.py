@@ -56,6 +56,11 @@ def tier_key(config: LLMConfig) -> tuple[str, ...]:
     return (config.provider, config.base_url, config.api_key_env)
 
 
+def cooldown_remaining(config: LLMConfig) -> float:
+    """Seconds until a tier's cooldown expires; 0 when it isn't cooling down."""
+    return max(0.0, _cooldowns.get(tier_key(config), 0.0) - _now())
+
+
 def is_health_failure(exc: BaseException) -> bool:
     """Whether a failure reflects the provider's state rather than this request."""
     seen: set[int] = set()

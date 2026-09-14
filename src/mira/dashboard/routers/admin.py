@@ -199,6 +199,47 @@ async def get_models() -> ModelsResponse:
     )
 
 
+@router.get("/api/settings/failover", response_model=_api.FailoverStatusResponse)
+def get_failover_status(request: Request) -> _api.FailoverStatusResponse:
+    """Configured failover tiers with live cooldown state (read-only)."""
+    _require_admin(request)
+    import math
+
+    from mira.config import load_config
+    from mira.dashboard.model_catalog import active_backend
+    from mira.dashboard.models_config import llm_config_for
+    from mira.llm.claude_cli import PROVIDER_NAMES as CLAUDE_PROVIDER_NAMES
+    from mira.llm.tiered import cooldown_remaining
+
+    llm = load_config().llm
+    review = llm_config_for("review", llm)
+    indexing = llm_config_for("indexing", llm)
+    pairs = [(review, indexing)]
+    if review.failover is not None and indexing.failover is not None:
+        pairs.append((review.failover, indexing.failover))
+
+    tiers = [
+        _api.FailoverTierModel(
+            tier=position,
+            backend=(
+                "claude-cli"
+                if review_cfg.provider in CLAUDE_PROVIDER_NAMES
+                else active_backend(review_cfg)
+            ),
+            review_model=review_cfg.model,
+            indexing_model=indexing_cfg.model,
+            cooldown_remaining_seconds=math.ceil(cooldown_remaining(review_cfg)),
+        )
+        for position, (review_cfg, indexing_cfg) in enumerate(pairs, start=1)
+    ]
+    return _api.FailoverStatusResponse(
+        enabled=llm.failover is not None,
+        cooldown_seconds=llm.failover_cooldown_seconds,
+        primary_max_retries=llm.failover_primary_max_retries,
+        tiers=tiers,
+    )
+
+
 @router.get("/api/admin/settings", response_model=GlobalSettingsResponse)
 def get_global_settings(request: Request) -> GlobalSettingsResponse:
     """Return the admin override blob + the effective overridable sections."""

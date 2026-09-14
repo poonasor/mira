@@ -226,6 +226,17 @@ class TestCooldown:
         assert tier_key(ZAI) == tier_key(ZAI.model_copy(update={"model": "glm-4.6"}))
         assert tier_key(CLAUDE) == ("claude-cli", "CLAUDE_CODE_OAUTH_TOKEN")
 
+    def test_cooldown_remaining_counts_down_to_zero(self, clock: list[float]):
+        assert tiered.cooldown_remaining(ZAI) == 0.0
+
+        tiered._cooldowns[tier_key(ZAI)] = clock[0] + 600
+        clock[0] += 150
+        assert tiered.cooldown_remaining(ZAI) == 450.0
+        assert tiered.cooldown_remaining(CLAUDE) == 0.0
+
+        clock[0] += 451
+        assert tiered.cooldown_remaining(ZAI) == 0.0
+
     def test_health_classification_reads_status_through_the_cause_chain(self):
         assert is_health_failure(http_failure(429))
         assert not is_health_failure(http_failure(400))
