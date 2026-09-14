@@ -12,9 +12,10 @@ llm:
   temperature: 0.2
   max_tokens: 4096
 
-  # ── Z.AI GLM-5.2 (general Chat Completions API) ──
+  # ── Z.AI GLM-5.2 (Chat Completions API) ──
   # api_style: "chat"
-  # base_url: "https://api.z.ai/api/paas/v4"
+  # base_url: "https://api.z.ai/api/paas/v4"          # general API key
+  # base_url: "https://api.z.ai/api/coding/paas/v4"   # GLM Coding Plan key
   # api_key_env: "ZAI_API_KEY"
   # model: "glm-5.2"
   # indexing_model: "glm-5.2"

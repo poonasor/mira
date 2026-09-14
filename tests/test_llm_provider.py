@@ -629,6 +629,26 @@ class TestZAIProfile:
         assert "reasoning_effort" not in bodies[1]
         assert "glm-5.2" in provider._no_reasoning
 
+    def test_profile_supplies_key_env_and_auto_tool_choice(self, monkeypatch: pytest.MonkeyPatch):
+        # With no api_key_env configured, the matched profile's ZAI_API_KEY is
+        # used and a forced tool choice is downgraded before any request.
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        provider = LLMProvider(LLMConfig(model="glm-5.2", base_url=self._BASE_URL))
+        forced = {"type": "function", "function": {"name": "submit_review"}}
+
+        assert provider.profile["name"] == "zai"
+        assert provider._build_headers()["Authorization"] == "Bearer zai-test-key"
+        assert provider._tool_choice("glm-5.2", forced) == "auto"
+
+
+class TestZAICodingPlanProfile(TestZAIProfile):
+    """Z.AI's Coding Plan endpoint speaks the same wire format as its general
+    API, so every inherited Z.AI test re-runs against this base URL."""
+
+    _BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+
 
 class TestToolChoiceFallback:
     """#82: thinking models (deepseek) 400 on a forced tool_choice; retry

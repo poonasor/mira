@@ -113,15 +113,18 @@ docker run -p 8000:8000 --env-file .env \
 
 ### Z.AI GLM
 
-Mira can call GLM-5.2 directly through Z.AI's general OpenAI-compatible Chat
-Completions endpoint:
+Mira can call GLM-5.2 directly through Z.AI's OpenAI-compatible Chat
+Completions API. Set `base_url` to the endpoint for your Z.AI key:
+
+- General API key: `https://api.z.ai/api/paas/v4`
+- GLM Coding Plan key: `https://api.z.ai/api/coding/paas/v4`
 
 ```yaml
 # mira.yaml
 llm:
   provider: "openai"
   api_style: "chat"
-  base_url: "https://api.z.ai/api/paas/v4"
+  base_url: "https://api.z.ai/api/paas/v4"   # or https://api.z.ai/api/coding/paas/v4
   api_key_env: "ZAI_API_KEY"
   model: "glm-5.2"
   indexing_model: "glm-5.2"
@@ -133,8 +136,12 @@ llm:
 ZAI_API_KEY=your-zai-api-key
 ```
 
-Use a general Z.AI API key for this endpoint. Z.AI's Coding Plan uses a
-different, tool-specific endpoint and is not configured by this profile.
+Both endpoints use the same wire format, so the bundled `zai` provider profile
+covers either one: Mira controls thinking with `thinking.type` plus a top-level
+`reasoning_effort`, sends `tool_choice: "auto"`, and the dashboard offers the
+curated GLM model list. Keys are tied to their plan, so match the endpoint to
+your key — a Coding Plan key sent to the general endpoint fails with an
+insufficient-balance error.
 
 ### Codex CLI
 

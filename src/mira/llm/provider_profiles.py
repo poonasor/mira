@@ -2,13 +2,17 @@
 
 Backed by ``providers.json``. A profile captures endpoint-specific behavior
 (attribution headers, model-prefix policy, reasoning remapping, tool-choice
-capabilities) as plain data. Profiles are matched to a request by ``base_url``;
-an endpoint with no matching profile gets ``DEFAULT_PROFILE`` (portable
-OpenAI-compatible shape).
+capabilities) as plain data. Profiles are matched to a request by ``base_url``,
+or by any alternate endpoint listed in ``base_urls`` that speaks the same wire
+format (e.g. Z.AI's Coding Plan endpoint); an endpoint with no matching profile
+gets ``DEFAULT_PROFILE`` (portable OpenAI-compatible shape).
 
 Operators can extend or override the bundled list at runtime by pointing
 ``MIRA_PROVIDERS_JSON_PATH`` at their own ``providers.json`` — same idiom as
-``MIRA_MODELS_JSON_PATH`` for the model registry.
+``MIRA_MODELS_JSON_PATH`` for the model registry. An override entry replaces
+the bundled profile of the same name wholesale (including its ``base_urls``)
+and is matched before any bundled profile, so an operator's profile for a URL
+wins even when a bundled profile also lists that URL.
 """
 
 from __future__ import annotations
@@ -46,13 +50,21 @@ def _read(path: Path) -> dict[str, dict]:
 
 @lru_cache(maxsize=1)
 def _load() -> dict[str, dict]:
-    """Load the registry once per process, overlaying any runtime override."""
+    """Load the registry once per process, overlaying any runtime override.
+
+    Override entries are ordered first so ``resolve`` matches them before any
+    bundled profile that claims the same URL.
+    """
     profiles = _read(_BUNDLED_PATH)
     override = os.environ.get(_OVERRIDE_ENV)
     if override:
         path = Path(override)
         try:
-            profiles = {**profiles, **_read(path)}
+            overrides = _read(path)
+            profiles = {
+                **overrides,
+                **{k: v for k, v in profiles.items() if k not in overrides},
+            }
             logger.info("Loaded provider overrides from %s (%s)", _OVERRIDE_ENV, path)
         except FileNotFoundError:
             logger.warning("%s=%s not found; using bundled providers only", _OVERRIDE_ENV, path)
@@ -81,9 +93,18 @@ def _norm(url: str) -> str:
     return url.rstrip("/")
 
 
-def resolve(base_url: str) -> dict:
-    """Return the profile whose ``base_url`` matches, or ``DEFAULT_PROFILE``.
+def _base_urls(profile: dict) -> set[str]:
+    """Every normalized URL a profile matches: ``base_url`` plus ``base_urls``."""
+    extra = profile.get("base_urls") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    return {_norm(url) for url in [profile.get("base_url", ""), *extra] if url}
 
+
+def resolve(base_url: str) -> dict:
+    """Return the profile matching ``base_url``, or ``DEFAULT_PROFILE``.
+
+    A profile matches on its ``base_url`` or any entry in ``base_urls``.
     Matched profiles are merged onto the default so callers can read every
     field (``api_styles``, ``model_prefix``, ``extra_headers``,
     ``reasoning_style``, ``supports_forced_tool_choice``, …) without
@@ -91,6 +112,6 @@ def resolve(base_url: str) -> dict:
     """
     target = _norm(base_url)
     for name, profile in _load().items():
-        if _norm(profile.get("base_url", "")) == target:
+        if target in _base_urls(profile):
             return {**DEFAULT_PROFILE, **profile, "name": name}
     return dict(DEFAULT_PROFILE)
