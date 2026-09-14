@@ -169,11 +169,46 @@ docker run -p 8000:8000 --env-file .env \
   ghcr.io/miracodeai/mira:latest --config /app/mira.yaml
 ```
 
-This provider does not require `OPENROUTER_API_KEY`. Mira copies only `auth.json`
-from the read-only mount into a private, writable temporary Codex home for each
-invocation. It launches Codex in an empty temporary workspace with a minimal
-environment, disables inherited shell environment variables and user/project
-rules, and enforces the read-only sandbox.
+This provider does not require `OPENROUTER_API_KEY`.
+
+#### Isolation guarantees
+
+The review prompt contains untrusted pull-request content, so Mira assumes a
+prompt-injected model and gives it no way to act beyond writing its answer:
+
+- **No tools that read files, run commands, or reach the network.** Codex runs
+  with its shell and exec tools (`shell_tool`, `unified_exec`), image viewer
+  (`view_image`), sub-agents (`multi_agent`, `multi_agent_v2`), code mode, apps,
+  plugins, browser and computer use, image generation, and hooks disabled, and
+  with web search off. A model that calls one of these tools anyway gets
+  `unsupported call` back and nothing runs.
+- **Fail closed on Codex upgrades.** Tools are switched off with `--disable`,
+  which rejects unknown feature names. If a Codex release renames or drops one,
+  reviews fail with `Unknown feature flag` instead of running with the tool on.
+  Tested with Codex 0.154.0, the version pinned in the official image. Releases
+  before the `view_image` feature flag existed can't disable the image viewer
+  and refuse to start.
+- **No inherited configuration.** `$CODEX_HOME/config.toml`, user and project
+  `.rules` files, and shell environment inheritance are ignored. Mira copies
+  only `auth.json` from the mount into a private temporary Codex home, runs
+  Codex in an empty temporary workspace with an allow-listed environment (no
+  Mira, GitHub, or database credentials), and discards both afterwards
+  (`--ephemeral`).
+- **No writes.** The `read-only` sandbox stays on as a second layer.
+
+What these guarantees do **not** cover:
+
+- The read-only sandbox blocks writes, not reads. Mira's file-safety comes from
+  the model having no file or shell tool, not from the sandbox. Before tools
+  were disabled, a canary test with a working sandbox showed an injected model
+  could `cat` a planted `/run/secrets` key and echo it into the review.
+- The Codex process itself runs with the Mira container's user and can read
+  whatever that user can, including its own copy of `auth.json`. Run the
+  container as a non-root user and keep unrelated secrets out of it as defense
+  in depth.
+- The prompt, including pull-request content and Mira's instructions, is sent
+  to OpenAI, and the model can put any of it in its answer.
+
 Provider choice, executable/auth paths, sandbox policy, and timeout are
 deployment-only settings; repository `.mira.yaml` files cannot override them.
 For one-shot `mira review` runs, `--config` is treated as untrusted by default.
