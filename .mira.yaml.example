@@ -34,6 +34,19 @@ llm:
   # retry_min_wait: 2
   # retry_max_wait: 30
 
+  # ── Cross-provider failover (deployment mira.yaml only; ignored in a repo's .mira.yaml) ──
+  # Calls that fail on the provider above are re-sent to `failover`. Rate limits,
+  # outages, auth errors, and timeouts also skip the primary for
+  # failover_cooldown_seconds before it is tried again.
+  # failover_cooldown_seconds: 600
+  # failover_primary_max_retries: 1
+  # failover:
+  #   provider: "claude-cli"   # Claude Code CLI on a Claude subscription
+  #   model: "sonnet"
+  #   max_context_tokens: 1000000
+  #   claude_oauth_token_env: "CLAUDE_CODE_OAUTH_TOKEN"   # token from `claude setup-token`
+  #   claude_max_concurrency: 2
+
 filter:
   # Minimum confidence threshold (0.0 - 1.0)
   confidence_threshold: 0.7

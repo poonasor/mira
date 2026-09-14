@@ -178,6 +178,45 @@ Mira disables ensemble sampling for this provider. The mounted OAuth session is
 still a sensitive deployment credential: use a dedicated Codex account/session
 and isolate the Mira container from unrelated host files and services.
 
+### Claude CLI failover
+
+Mira can fail over from its primary provider to Claude through the Claude Code
+CLI, authenticated with a Claude subscription instead of an Anthropic API key.
+Create a long-lived token with `claude setup-token` and pass it to the container
+as `CLAUDE_CODE_OAUTH_TOKEN`:
+
+```yaml
+# mira.yaml
+llm:
+  base_url: "https://api.z.ai/api/paas/v4"   # primary provider, unchanged
+  api_key_env: "ZAI_API_KEY"
+  model: "glm-5.2"
+  failover_cooldown_seconds: 600    # skip the primary this long after a provider-side failure
+  failover_primary_max_retries: 1   # retry the primary less so failover happens quickly
+  failover:
+    provider: "claude-cli"
+    model: "sonnet"
+    max_context_tokens: 1000000
+    claude_oauth_token_env: "CLAUDE_CODE_OAUTH_TOKEN"   # optional; this is the default
+    claude_max_concurrency: 2                           # optional
+```
+
+A call that fails on the primary is re-sent to the failover provider. Rate
+limits, 5xx responses, timeouts, network errors, and auth errors also put the
+primary into a cooldown, so later calls go straight to the failover provider
+until it expires. Dashboard model overrides apply to the primary only; the
+failover provider uses the models in its own block. `provider: "claude-cli"`
+also works on its own, without failover.
+
+The official Mira image includes a pinned Claude Code CLI. Each call runs
+`claude -p` in an empty temporary directory with a minimal environment — only
+the subscription token is passed, never `ANTHROPIC_API_KEY` or Mira's service
+credentials — and with no tools, MCP servers, hooks, settings, slash commands,
+or saved session. Provider choice, the token variable, and all failover settings
+are deployment-only, as are `base_url` and `api_key_env`: repository
+`.mira.yaml` files cannot set them. Automated use draws on the subscription's
+usage limits; `claude_max_concurrency` caps how many CLI processes run at once.
+
 ## Configuration
 
 `mira.yaml` (loaded via `--config`) holds deployment-wide defaults. Drop a `.mira.yaml` in any repo — or use the dashboard — to override per-repo; both deep-merge over `mira.yaml` for that repo only:
