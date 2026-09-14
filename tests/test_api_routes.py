@@ -81,6 +81,7 @@ EXPECTED_ROUTES = {
     ("/api/rules/global/{rule_id}", "DELETE"),
     ("/api/rules/global/{rule_id}", "PUT"),
     ("/api/rules/global/{rule_id}/toggle", "PATCH"),
+    ("/api/settings/failover", "GET"),
     ("/api/settings/models", "GET"),
     ("/api/settings/models", "PUT"),
     ("/api/setup/complete", "POST"),

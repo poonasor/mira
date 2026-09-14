@@ -386,6 +386,26 @@ class ModelsUpdate(BaseModel):
     api_style: str = "chat"
 
 
+class FailoverTierModel(BaseModel):
+    tier: int
+    backend: (
+        str  # "zai" | "openrouter" | "bedrock" | "codex-cli" | "claude-cli" | "openai-compatible"
+    )
+    review_model: str
+    indexing_model: str
+    cooldown_remaining_seconds: int  # 0 = not cooling down
+
+
+class FailoverStatusResponse(BaseModel):
+    """Read-only failover view. Deliberately omits endpoints, key/token env
+    names, and command paths — those stay in mira.yaml."""
+
+    enabled: bool
+    cooldown_seconds: int
+    primary_max_retries: int
+    tiers: list[FailoverTierModel]
+
+
 class GlobalSettingsResponse(BaseModel):
     overrides: dict
     effective: dict
