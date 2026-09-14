@@ -105,8 +105,8 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
         cache_key = f"bedrock:{config.region}:{config.aws_profile or ''}"
     elif backend in {"codex-cli", "zai"}:
         # These backends use a curated static catalog. Codex CLI has no model
-        # list API; Z.AI's general API documents Chat Completions but no
-        # OpenAI-style /models endpoint.
+        # list API; Z.AI documents Chat Completions but no OpenAI-style
+        # /models endpoint for either its general or Coding Plan API.
         return None
     else:
         cache_key = config.base_url

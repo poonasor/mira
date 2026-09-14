@@ -34,8 +34,18 @@ class TestActiveBackend:
             active_backend(LLMConfig(base_url="http://localhost:11434/v1")) == "openai-compatible"
         )
 
-    def test_zai_endpoint(self):
-        assert active_backend(LLMConfig(base_url="https://api.z.ai/api/paas/v4")) == "zai"
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://api.z.ai/api/paas/v4",
+            "https://api.z.ai/api/coding/paas/v4",
+            "https://api.z.ai/api/coding/paas/v4/",
+        ],
+    )
+    def test_zai_endpoint(self, base_url: str):
+        # The Coding Plan endpoint shares Z.AI's profile, so it gets the
+        # curated catalog instead of being treated as a generic endpoint.
+        assert active_backend(LLMConfig(base_url=base_url)) == "zai"
 
 
 class TestBuildOptions:
@@ -142,14 +152,17 @@ class TestFetchCatalog:
         assert calls == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "base_url", ["https://api.z.ai/api/paas/v4", "https://api.z.ai/api/coding/paas/v4"]
+    )
     async def test_zai_uses_static_catalog_without_models_request(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, base_url: str, monkeypatch: pytest.MonkeyPatch
     ):
         async def unexpected(*args, **kwargs):
             raise AssertionError("Z.AI catalog must not call an undocumented /models endpoint")
 
         monkeypatch.setattr(model_catalog, "_fetch_openai_style", unexpected)
-        config = LLMConfig(base_url="https://api.z.ai/api/paas/v4", api_key_env="ZAI_API_KEY")
+        config = LLMConfig(base_url=base_url, api_key_env="ZAI_API_KEY")
         assert await fetch_catalog(config) is None
 
     @pytest.mark.asyncio
