@@ -14,6 +14,18 @@ class TestResolve:
         assert p["model_prefix"] == "keep"
         assert p["extra_headers"]["X-Title"] == "Mira Code Reviewer"
         assert p["reasoning_effort_map"] == {"max": "xhigh"}
+        assert p["api_styles"] == ["chat", "responses"]
+        assert p["reasoning_style"] == "nested"
+        assert p["supports_forced_tool_choice"] is True
+
+    def test_matches_zai_by_base_url(self):
+        p = profiles.resolve("https://api.z.ai/api/paas/v4")
+        assert p["name"] == "zai"
+        assert p["api_key_env"] == "ZAI_API_KEY"
+        assert p["api_styles"] == ["chat"]
+        assert p["model_prefix"] == "strip"
+        assert p["reasoning_style"] == "zai"
+        assert p["supports_forced_tool_choice"] is False
 
     def test_trailing_slash_insensitive(self):
         assert profiles.resolve("https://openrouter.ai/api/v1/")["name"] == "openrouter"
@@ -24,6 +36,9 @@ class TestResolve:
         assert p["model_prefix"] == "strip"
         assert p["extra_headers"] == {}
         assert p["reasoning_effort_map"] == {}
+        assert p["api_styles"] == ["chat", "responses"]
+        assert p["reasoning_style"] == "nested"
+        assert p["supports_forced_tool_choice"] is True
 
     def test_sparse_profile_fills_from_default(self, tmp_path, monkeypatch):
         # A profile with only base_url + api_key_env still resolves with every
@@ -40,6 +55,9 @@ class TestResolve:
             assert p["model_prefix"] == "strip"
             assert p["extra_headers"] == {}
             assert p["reasoning_effort_map"] == {}
+            assert p["api_styles"] == ["chat", "responses"]
+            assert p["reasoning_style"] == "nested"
+            assert p["supports_forced_tool_choice"] is True
         finally:
             profiles._load.cache_clear()
 

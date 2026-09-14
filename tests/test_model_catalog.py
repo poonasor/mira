@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -33,6 +34,9 @@ class TestActiveBackend:
             active_backend(LLMConfig(base_url="http://localhost:11434/v1")) == "openai-compatible"
         )
 
+    def test_zai_endpoint(self):
+        assert active_backend(LLMConfig(base_url="https://api.z.ai/api/paas/v4")) == "zai"
+
 
 class TestBuildOptions:
     def test_registry_filtered_by_backend(self):
@@ -50,6 +54,12 @@ class TestBuildOptions:
     def test_openrouter_does_not_offer_codex_models(self):
         values = [m["value"] for m in build_options("openrouter", None, "review")]
         assert "codex-default" not in values
+
+    @pytest.mark.parametrize("purpose", ["indexing", "review"])
+    def test_zai_only_offers_curated_glm_model(self, purpose: str):
+        dynamic = [{"value": "glm-5.3", "label": "GLM-5.3"}]
+        values = [m["value"] for m in build_options("zai", dynamic, purpose)]
+        assert values == ["glm-5.2"]
 
     def test_dynamic_merged_and_deduped_against_registry(self):
         dynamic = [
@@ -79,6 +89,30 @@ class TestBuildOptions:
 
 class TestFetchCatalog:
     @pytest.mark.asyncio
+    async def test_openai_fetch_resolves_profile_for_api_key(self, monkeypatch: pytest.MonkeyPatch):
+        seen: dict = {}
+
+        def fake_get_api_key(config, profile=None):
+            seen["profile"] = profile
+            return "zai-test-key"
+
+        response = MagicMock()
+        response.json.return_value = {"data": [{"id": "glm-5.2"}]}
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=response)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(model_catalog, "_get_api_key", fake_get_api_key)
+        monkeypatch.setattr(model_catalog.httpx, "AsyncClient", lambda **kwargs: client)
+
+        config = LLMConfig(base_url="https://api.z.ai/api/paas/v4")
+        result = await model_catalog._fetch_openai_style(config, tools_only=False)
+
+        assert seen["profile"]["name"] == "zai"
+        assert client.get.call_args.kwargs["headers"] == {"Authorization": "Bearer zai-test-key"}
+        assert result == [{"value": "glm-5.2", "label": "glm-5.2"}]
+
+    @pytest.mark.asyncio
     async def test_failure_returns_none_and_is_cached(self, monkeypatch: pytest.MonkeyPatch):
         calls = 0
 
@@ -106,6 +140,17 @@ class TestFetchCatalog:
         assert await fetch_catalog(LLMConfig()) == [{"value": "m", "label": "m"}]
         assert await fetch_catalog(LLMConfig()) == [{"value": "m", "label": "m"}]
         assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_zai_uses_static_catalog_without_models_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        async def unexpected(*args, **kwargs):
+            raise AssertionError("Z.AI catalog must not call an undocumented /models endpoint")
+
+        monkeypatch.setattr(model_catalog, "_fetch_openai_style", unexpected)
+        config = LLMConfig(base_url="https://api.z.ai/api/paas/v4", api_key_env="ZAI_API_KEY")
+        assert await fetch_catalog(config) is None
 
     @pytest.mark.asyncio
     async def test_concurrent_cold_fetches_coalesce(self, monkeypatch: pytest.MonkeyPatch):

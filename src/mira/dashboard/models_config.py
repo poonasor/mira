@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from mira.config import LLMConfig
+from mira.llm import provider_profiles as profiles
 from mira.llm import registry
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,19 @@ API_STYLE_VALUES = {m["value"] for m in API_STYLES}
 
 
 def resolve_api_style(config: LLMConfig, db_value: str | None = None) -> str:
-    """Resolve the API protocol: DB → config.api_style → "chat"."""
-    if db_value and db_value in API_STYLE_VALUES:
+    """Resolve the API protocol: DB → config.api_style → provider default."""
+    supported = profiles.resolve(config.base_url).get("api_styles", ["chat", "responses"])
+    if db_value and db_value in API_STYLE_VALUES and db_value in supported:
         return db_value
-    return config.api_style if config.api_style in API_STYLE_VALUES else "chat"
+    if config.api_style in API_STYLE_VALUES and config.api_style in supported:
+        return config.api_style
+    return supported[0] if supported else "chat"
+
+
+def api_styles_for(config: LLMConfig) -> list[dict[str, str]]:
+    """Dashboard protocol options supported by the configured endpoint."""
+    supported = set(profiles.resolve(config.base_url).get("api_styles", ["chat", "responses"]))
+    return [style for style in API_STYLES if style["value"] in supported]
 
 
 def estimate_indexing_cost(file_count: int, model: str) -> dict:
@@ -143,7 +153,9 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
 
     Reads the DB setting first (via _app_db), falls back to config fields.
     Logs the effective model and where it came from, so a dashboard override
-    shadowing mira.yaml is visible instead of silent (issue #124).
+    shadowing mira.yaml is visible instead of silent (issue #124). Dashboard
+    overrides pick from the primary provider's catalog, so a ``failover``
+    provider resolves its models from its own config fields only.
     """
     db_model: str | None = None
     db_thinking: str | None = None
@@ -166,6 +178,27 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     except Exception:
         pass  # DB not available — resolve from config fields alone
 
+    resolved = _resolve_for_purpose(
+        purpose, base, db_model, db_thinking, db_review, db_style, label=purpose.capitalize()
+    )
+    if base.failover is None:
+        return resolved
+    failover = _resolve_for_purpose(
+        purpose, base.failover, None, None, None, None, label=f"{purpose.capitalize()} failover"
+    )
+    return resolved.model_copy(update={"failover": failover})
+
+
+def _resolve_for_purpose(
+    purpose: str,
+    base: LLMConfig,
+    db_model: str | None,
+    db_thinking: str | None,
+    db_review: str | None,
+    db_style: str | None,
+    *,
+    label: str,
+) -> LLMConfig:
     # Thinking mode only applies to reviews; other purposes leave it off.
     thinking_mode: str | None = None
     resolved_style = resolve_api_style(base, db_style)

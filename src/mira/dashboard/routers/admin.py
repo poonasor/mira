@@ -154,8 +154,8 @@ async def get_models() -> ModelsResponse:
     from mira.config import load_config
     from mira.dashboard.model_catalog import active_backend, build_options, fetch_catalog
     from mira.dashboard.models_config import (
-        API_STYLES,
         THINKING_MODES,
+        api_styles_for,
         get_indexing_model,
         get_review_model,
         get_review_thinking_mode,
@@ -195,7 +195,7 @@ async def get_models() -> ModelsResponse:
         review_thinking_mode=thinking or "off",
         thinking_options=[ModelOption(**m) for m in THINKING_MODES],
         api_style=api_style,
-        api_style_options=[ModelOption(**m) for m in API_STYLES],
+        api_style_options=[ModelOption(**m) for m in api_styles_for(config.llm)],
     )
 
 

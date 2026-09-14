@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from click.testing import CliRunner
 
 from mira.cli import _format_json, _format_text, main
+from mira.config import MiraConfig
 from mira.models import (
     FileChangeType,
     ReviewComment,
@@ -244,7 +245,7 @@ class TestCLI:
             patch("mira.cli.ReviewEngine") as mock_engine_cls,
             patch("mira.cli.load_config") as mock_load,
         ):
-            mock_load.return_value = MagicMock()
+            mock_load.return_value = MiraConfig()
             mock_engine = MagicMock()
             mock_engine.review_diff = AsyncMock(return_value=review_result)
             mock_engine_cls.return_value = mock_engine
@@ -314,7 +315,7 @@ class TestCLI:
             patch("mira.cli.ReviewEngine") as mock_engine_cls,
             patch("mira.cli.load_config") as mock_load,
         ):
-            mock_load.return_value = MagicMock()
+            mock_load.return_value = MiraConfig()
             mock_engine = MagicMock()
             mock_engine.review_diff = AsyncMock(return_value=review_result)
             mock_engine_cls.return_value = mock_engine
@@ -335,7 +336,7 @@ class TestCLI:
             patch("mira.cli.ReviewEngine") as mock_engine_cls,
             patch("mira.cli.load_config") as mock_load,
         ):
-            mock_load.return_value = MagicMock()
+            mock_load.return_value = MiraConfig()
             mock_engine = MagicMock()
             mock_engine.review_diff = AsyncMock(return_value=review_result)
             mock_engine_cls.return_value = mock_engine

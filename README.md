@@ -26,7 +26,7 @@ Mira reviews your pull requests using your choice of LLM (via [OpenRouter](https
 
 ## Why Teams Choose Mira
 
-- **Model agnostic** — Run Claude, GPT, Gemini, DeepSeek, Llama, or any OpenAI-compatible endpoint: OpenRouter, vLLM, Ollama, Together, Groq, Fireworks, or AWS Bedrock direct. Per-provider quirks are config, not code, so adding a provider is a one-line entry.
+- **Model agnostic** — Run Claude, GPT, Gemini, GLM, DeepSeek, Llama, or any OpenAI-compatible endpoint: OpenRouter, Z.AI, vLLM, Ollama, Together, Groq, Fireworks, or AWS Bedrock direct. Per-provider quirks are config, not code, so adding a provider is a one-line entry.
 - **Zero markup on LLM costs** — Bring your own key. You pay the model provider directly; Mira never proxies your spend or adds a multiplier. The dashboard shows real per-repo, per-model cost — not estimates.
 - **Learns from your context** — Mira synthesizes rules from your merged PRs: rejected comments and human review patterns become team rules that shape future reviews.
 - **You set the rules** — Define custom and org-wide review rules in plain language, per-repo via `.mira.yaml` or from the dashboard.
@@ -111,6 +111,31 @@ docker run -p 8000:8000 --env-file .env \
 
 → Full walkthrough: [creating the GitHub App & quickstart](https://docs.miracode.ai/quickstart) · [GitLab setup](https://docs.miracode.ai/gitlab) · [deploy options](https://docs.miracode.ai/deployment) · [choosing models, custom endpoints & AWS Bedrock](https://docs.miracode.ai/configuration/models)
 
+### Z.AI GLM
+
+Mira can call GLM-5.2 directly through Z.AI's general OpenAI-compatible Chat
+Completions endpoint:
+
+```yaml
+# mira.yaml
+llm:
+  provider: "openai"
+  api_style: "chat"
+  base_url: "https://api.z.ai/api/paas/v4"
+  api_key_env: "ZAI_API_KEY"
+  model: "glm-5.2"
+  indexing_model: "glm-5.2"
+  review_model: "glm-5.2"
+```
+
+```bash
+# .env
+ZAI_API_KEY=your-zai-api-key
+```
+
+Use a general Z.AI API key for this endpoint. Z.AI's Coding Plan uses a
+different, tool-specific endpoint and is not configured by this profile.
+
 ### Codex CLI
 
 If you already use OpenAI Codex locally, Mira can run reviews through the
@@ -152,6 +177,45 @@ Codex CLI does not expose Mira's temperature or hard output-token controls, so
 Mira disables ensemble sampling for this provider. The mounted OAuth session is
 still a sensitive deployment credential: use a dedicated Codex account/session
 and isolate the Mira container from unrelated host files and services.
+
+### Claude CLI failover
+
+Mira can fail over from its primary provider to Claude through the Claude Code
+CLI, authenticated with a Claude subscription instead of an Anthropic API key.
+Create a long-lived token with `claude setup-token` and pass it to the container
+as `CLAUDE_CODE_OAUTH_TOKEN`:
+
+```yaml
+# mira.yaml
+llm:
+  base_url: "https://api.z.ai/api/paas/v4"   # primary provider, unchanged
+  api_key_env: "ZAI_API_KEY"
+  model: "glm-5.2"
+  failover_cooldown_seconds: 600    # skip the primary this long after a provider-side failure
+  failover_primary_max_retries: 1   # retry the primary less so failover happens quickly
+  failover:
+    provider: "claude-cli"
+    model: "sonnet"
+    max_context_tokens: 1000000
+    claude_oauth_token_env: "CLAUDE_CODE_OAUTH_TOKEN"   # optional; this is the default
+    claude_max_concurrency: 2                           # optional
+```
+
+A call that fails on the primary is re-sent to the failover provider. Rate
+limits, 5xx responses, timeouts, network errors, and auth errors also put the
+primary into a cooldown, so later calls go straight to the failover provider
+until it expires. Dashboard model overrides apply to the primary only; the
+failover provider uses the models in its own block. `provider: "claude-cli"`
+also works on its own, without failover.
+
+The official Mira image includes a pinned Claude Code CLI. Each call runs
+`claude -p` in an empty temporary directory with a minimal environment — only
+the subscription token is passed, never `ANTHROPIC_API_KEY` or Mira's service
+credentials — and with no tools, MCP servers, hooks, settings, slash commands,
+or saved session. Provider choice, the token variable, and all failover settings
+are deployment-only, as are `base_url` and `api_key_env`: repository
+`.mira.yaml` files cannot set them. Automated use draws on the subscription's
+usage limits; `claude_max_concurrency` caps how many CLI processes run at once.
 
 ## Configuration
 

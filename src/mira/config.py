@@ -84,6 +84,26 @@ class LLMConfig(BaseModel):
     codex_home: str | None = None
     codex_sandbox: Literal["read-only"] = "read-only"
     codex_timeout_seconds: int = Field(default=900, gt=0)
+    # Claude Code CLI provider settings. Auth is a Claude subscription OAuth token
+    # (`claude setup-token`) read from `claude_oauth_token_env`; no Anthropic API key.
+    claude_command: str = "claude"
+    claude_oauth_token_env: str = "CLAUDE_CODE_OAUTH_TOKEN"
+    claude_timeout_seconds: int = Field(default=900, gt=0)
+    claude_max_concurrency: int = Field(default=2, ge=1)
+    # Cross-provider failover. Calls that fail here are re-issued to `failover`;
+    # provider-side failures (rate limit, outage, auth, timeout) also skip this
+    # provider for `failover_cooldown_seconds`. Retries here are capped at
+    # `failover_primary_max_retries` so long retry loops don't delay failover.
+    failover: LLMConfig | None = None
+    failover_cooldown_seconds: int = Field(default=600, ge=0)
+    failover_primary_max_retries: int = Field(default=1, ge=1)
+
+    @field_validator("failover")
+    @classmethod
+    def _validate_failover(cls, v: LLMConfig | None) -> LLMConfig | None:
+        if v is not None and v.failover is not None:
+            raise ValueError("llm.failover cannot itself define a failover")
+        return v
 
     @field_validator("base_url")
     @classmethod
@@ -332,19 +352,30 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 _global_defaults: dict[str, Any] = {}
 
+# A repo must not choose what runs, where requests go, or which env var is sent
+# as the bearer key — pointing base_url at its own server would leak that secret.
 _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
     {
         "provider",
+        "base_url",
+        "api_key_env",
         "codex_command",
         "codex_home",
         "codex_sandbox",
         "codex_timeout_seconds",
+        "claude_command",
+        "claude_oauth_token_env",
+        "claude_timeout_seconds",
+        "claude_max_concurrency",
+        "failover",
+        "failover_cooldown_seconds",
+        "failover_primary_max_retries",
     }
 )
 
 
 def _strip_deployment_only_llm_settings(overlay: dict[str, Any]) -> dict[str, Any]:
-    """Remove process-execution settings from an untrusted per-repo overlay."""
+    """Remove execution and credential-routing settings from an untrusted per-repo overlay."""
     cleaned = dict(overlay)
     llm = cleaned.get("llm")
     if not isinstance(llm, dict):

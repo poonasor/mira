@@ -41,6 +41,7 @@ class LLMError(MiraError):
 
     def __init__(self, code: str, **kwargs: object) -> None:
         self._code = code
+        self.details = kwargs
         self._full, self._safe = get_error_message(code, **kwargs)
         super().__init__(self._full)
 
