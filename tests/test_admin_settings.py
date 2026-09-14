@@ -126,6 +126,69 @@ class TestEndpointAuthorization:
         assert resp.effective["filter"]["max_comments"] == 8
 
 
+class TestEffectiveRedaction:
+    """GET must not echo credentials or deployment internals via `effective`."""
+
+    def test_effective_limited_to_overridable_sections(self, in_memory_db: AppDatabase):
+        resp = get_global_settings(_admin_request())
+        assert set(resp.effective) == _ALLOWED_OVERRIDE_SECTIONS
+
+    def test_effective_keeps_fields_settings_page_reads(self, in_memory_db: AppDatabase):
+        in_memory_db.set_global_review_overrides({"review": {"auto_resolve_conversations": False}})
+        resp = get_global_settings(_admin_request())
+        for key in ("confidence_threshold", "max_comments", "max_files"):
+            assert key in resp.effective["filter"]
+        for key in (
+            "walkthrough",
+            "self_critique",
+            "security_pass",
+            "blast_radius",
+            "dependency_overlap",
+            "auto_resolve_conversations",
+            "review_on_synchronize",
+            "max_concurrent_chunks",
+        ):
+            assert key in resp.effective["review"]
+        assert resp.effective["review"]["auto_resolve_conversations"] is False
+
+    def test_secrets_and_llm_internals_not_exposed(
+        self, in_memory_db: AppDatabase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://mira:db-s3cret@dbhost-internal:5432/mira")
+        global_yaml = tmp_path / "mira.yaml"
+        # Dotless hosts: plain http is only accepted for local/compose-style names.
+        global_yaml.write_text(
+            "database:\n"
+            "  admin_password: admin-s3cret\n"
+            "llm:\n"
+            "  base_url: http://llmgateway-internal:8080/v1\n"
+            "  codex_command: /opt/secret-bin/codex\n"
+            "  codex_home: /srv/codex-home\n"
+            "  claude_command: /opt/secret-bin/claude\n"
+            "  failover:\n"
+            "    base_url: http://failover-internal/v1\n"
+        )
+        set_global_defaults(global_yaml)
+
+        # Sanity: the loaded config really carries the values we check for.
+        cfg = load_config()
+        assert "db-s3cret" in cfg.database.url
+        assert cfg.database.admin_password == "admin-s3cret"
+        assert cfg.llm.failover is not None
+
+        body = get_global_settings(_admin_request()).model_dump_json()
+        for leaked in (
+            "db-s3cret",
+            "dbhost-internal",
+            "admin-s3cret",
+            "llmgateway-internal",
+            "failover-internal",
+            "/opt/secret-bin",
+            "/srv/codex-home",
+        ):
+            assert leaked not in body
+
+
 class TestEndpointValidation:
     def test_rejects_disallowed_section(self, in_memory_db: AppDatabase):
         with pytest.raises(HTTPException) as exc:

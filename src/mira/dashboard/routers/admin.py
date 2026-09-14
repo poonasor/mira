@@ -201,7 +201,7 @@ async def get_models() -> ModelsResponse:
 
 @router.get("/api/admin/settings", response_model=GlobalSettingsResponse)
 def get_global_settings(request: Request) -> GlobalSettingsResponse:
-    """Return the admin override blob + the effective config."""
+    """Return the admin override blob + the effective overridable sections."""
     user = getattr(request.state, "user", None)
     if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -209,7 +209,10 @@ def get_global_settings(request: Request) -> GlobalSettingsResponse:
     from mira.config import load_config
 
     overrides = _api._app_db.get_global_review_overrides()
-    effective = load_config().model_dump()
+    # Allowlist: only the sections admins can override (which is all the
+    # Settings page reads). The full dump would expose database credentials,
+    # the admin password, and LLM execution/credential-routing internals.
+    effective = load_config().model_dump(include=_ALLOWED_OVERRIDE_SECTIONS)
     return GlobalSettingsResponse(overrides=overrides, effective=effective)
 
 
