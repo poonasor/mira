@@ -123,6 +123,60 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Codex CLI response did not contain a JSON object: {excerpt}",
         safe="Codex CLI response did not contain a JSON object",
     ),
+    # Claude Code CLI provider errors
+    "claude_token_missing": ErrorMessage(
+        full="Claude subscription token not found: set {token_env} to the token from `claude setup-token`.",
+        safe="Claude subscription token not configured",
+    ),
+    "claude_command_not_found": ErrorMessage(
+        full="Claude Code CLI command not found: {command!r}. Install @anthropic-ai/claude-code or set llm.claude_command.",
+        safe="Claude Code CLI command not found",
+    ),
+    "claude_timeout": ErrorMessage(
+        full="Claude Code CLI timed out after {seconds}s",
+        safe="Claude Code CLI timed out",
+    ),
+    "claude_exit_failed": ErrorMessage(
+        full="Claude Code CLI failed with exit {exit_code}: {detail}",
+        safe="Claude Code CLI failed",
+    ),
+    "claude_malformed_output": ErrorMessage(
+        full="Claude Code CLI output was not a JSON result: {excerpt}",
+        safe="Claude Code CLI returned unreadable output",
+    ),
+    "claude_auth_failed": ErrorMessage(
+        full="Claude Code CLI authentication failed (status {status}): {detail}",
+        safe="Claude Code CLI authentication failed",
+    ),
+    "claude_usage_limit": ErrorMessage(
+        full="Claude subscription rate or usage limit reached (status {status}): {detail}",
+        safe="Claude subscription usage limit reached",
+    ),
+    "claude_api_error": ErrorMessage(
+        full="Claude Code CLI API error (status {status}, exit {exit_code}): {detail}",
+        safe="Claude Code CLI API error",
+    ),
+    "claude_empty_response": ErrorMessage(
+        full="Claude Code CLI returned an empty response",
+        safe="Claude Code CLI returned an empty response",
+    ),
+    "claude_non_object_json": ErrorMessage(
+        full="Claude Code CLI response must be a JSON object, got {type}",
+        safe="Claude Code CLI response must be a JSON object",
+    ),
+    "claude_malformed_json": ErrorMessage(
+        full="Claude Code CLI returned malformed JSON: {error}: {excerpt}",
+        safe="Claude Code CLI returned malformed JSON",
+    ),
+    "claude_no_json_object": ErrorMessage(
+        full="Claude Code CLI response did not contain a JSON object: {excerpt}",
+        safe="Claude Code CLI response did not contain a JSON object",
+    ),
+    # Cross-provider failover
+    "all_providers_failed": ErrorMessage(
+        full="All LLM provider tiers failed: {errors}",
+        safe="All configured LLM providers failed",
+    ),
 }
 
 

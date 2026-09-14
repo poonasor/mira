@@ -153,7 +153,9 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
 
     Reads the DB setting first (via _app_db), falls back to config fields.
     Logs the effective model and where it came from, so a dashboard override
-    shadowing mira.yaml is visible instead of silent (issue #124).
+    shadowing mira.yaml is visible instead of silent (issue #124). Dashboard
+    overrides pick from the primary provider's catalog, so a ``failover``
+    provider resolves its models from its own config fields only.
     """
     db_model: str | None = None
     db_thinking: str | None = None
@@ -176,6 +178,27 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     except Exception:
         pass  # DB not available — resolve from config fields alone
 
+    resolved = _resolve_for_purpose(
+        purpose, base, db_model, db_thinking, db_review, db_style, label=purpose.capitalize()
+    )
+    if base.failover is None:
+        return resolved
+    failover = _resolve_for_purpose(
+        purpose, base.failover, None, None, None, None, label=f"{purpose.capitalize()} failover"
+    )
+    return resolved.model_copy(update={"failover": failover})
+
+
+def _resolve_for_purpose(
+    purpose: str,
+    base: LLMConfig,
+    db_model: str | None,
+    db_thinking: str | None,
+    db_review: str | None,
+    db_style: str | None,
+    *,
+    label: str,
+) -> LLMConfig:
     # Thinking mode only applies to reviews; other purposes leave it off.
     thinking_mode: str | None = None
     resolved_style = resolve_api_style(base, db_style)
