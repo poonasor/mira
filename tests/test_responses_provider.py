@@ -559,6 +559,14 @@ class TestCreateLlmDispatch:
         provider = create_llm(LLMConfig(api_style="chat"))
         assert isinstance(provider, LLMProvider)
 
+    def test_zai_profile_forces_chat_style(self):
+        from mira.llm.provider import LLMProvider
+
+        provider = create_llm(
+            LLMConfig(base_url="https://api.z.ai/api/paas/v4", api_style="responses")
+        )
+        assert isinstance(provider, LLMProvider)
+
     def test_bedrock_ignores_api_style(self):
         from mira.llm.bedrock import BedrockProvider
 

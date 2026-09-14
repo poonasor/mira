@@ -1,10 +1,10 @@
 """Provider-profile registry — per-provider quirks for the OpenAI-compatible client.
 
-Backed by ``providers.json``. A profile captures what Mira used to special-case
-for OpenRouter (attribution headers, model-prefix policy, reasoning remapping)
-as plain data, so adding a provider is a one-line registry entry rather than a
-code branch. Profiles are matched to a request by ``base_url``; an endpoint with
-no matching profile gets ``DEFAULT_PROFILE`` (portable OpenAI-compatible shape).
+Backed by ``providers.json``. A profile captures endpoint-specific behavior
+(attribution headers, model-prefix policy, reasoning remapping, tool-choice
+capabilities) as plain data. Profiles are matched to a request by ``base_url``;
+an endpoint with no matching profile gets ``DEFAULT_PROFILE`` (portable
+OpenAI-compatible shape).
 
 Operators can extend or override the bundled list at runtime by pointing
 ``MIRA_PROVIDERS_JSON_PATH`` at their own ``providers.json`` — same idiom as
@@ -28,9 +28,12 @@ _OVERRIDE_ENV = "MIRA_PROVIDERS_JSON_PATH"
 # no attribution headers, no reasoning remap.
 DEFAULT_PROFILE: dict = {
     "name": "",
+    "api_styles": ["chat", "responses"],
     "model_prefix": "strip",
     "extra_headers": {},
     "reasoning_effort_map": {},
+    "reasoning_style": "nested",
+    "supports_forced_tool_choice": True,
     "api_key_env": None,
 }
 
@@ -82,7 +85,9 @@ def resolve(base_url: str) -> dict:
     """Return the profile whose ``base_url`` matches, or ``DEFAULT_PROFILE``.
 
     Matched profiles are merged onto the default so callers can read every
-    field (``model_prefix``, ``extra_headers``, …) without per-key guards.
+    field (``api_styles``, ``model_prefix``, ``extra_headers``,
+    ``reasoning_style``, ``supports_forced_tool_choice``, …) without
+    per-key guards.
     """
     target = _norm(base_url)
     for name, profile in _load().items():

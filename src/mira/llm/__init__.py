@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from mira.config import LLMConfig
+from mira.llm import provider_profiles as profiles
 from mira.llm.base import LLMProviderProtocol
 
 
@@ -21,7 +22,8 @@ def create_llm(config: LLMConfig) -> LLMProviderProtocol:
 
         return CodexCLIProvider(config)
 
-    if config.api_style == "responses":
+    profile = profiles.resolve(config.base_url)
+    if config.api_style == "responses" and "responses" in profile.get("api_styles", []):
         from mira.llm.responses import ResponsesProvider
 
         return ResponsesProvider(config)

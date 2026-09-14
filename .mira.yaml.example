@@ -12,6 +12,14 @@ llm:
   temperature: 0.2
   max_tokens: 4096
 
+  # ── Z.AI GLM-5.2 (general Chat Completions API) ──
+  # api_style: "chat"
+  # base_url: "https://api.z.ai/api/paas/v4"
+  # api_key_env: "ZAI_API_KEY"
+  # model: "glm-5.2"
+  # indexing_model: "glm-5.2"
+  # review_model: "glm-5.2"
+
   # ── AWS Bedrock configuration (uncomment to use) ──
   # provider: "bedrock"
   # model: "us.anthropic.claude-sonnet-4-6-v1:0"

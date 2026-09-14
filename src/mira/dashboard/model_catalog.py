@@ -1,10 +1,10 @@
 """Dynamic model catalog — lists models from the configured backend.
 
-The static registry (llm/models.json) uses OpenRouter-style ids, so a
-deployment on Bedrock or a generic OpenAI-compatible endpoint would be
-offered ids its backend can't serve. Detect the active backend, fetch its
-live model list (cached for an hour; failures for a minute), and fall back
-to the backend-filtered registry when the fetch fails.
+Most entries in the static registry (llm/models.json) use OpenRouter-style
+ids, so a deployment on Bedrock, Z.AI, or a generic OpenAI-compatible endpoint
+must not be offered ids its backend can't serve. Detect the active backend,
+fetch its live model list where appropriate (cached for an hour; failures for
+a minute), and fall back to the backend-filtered registry when the fetch fails.
 """
 
 from __future__ import annotations
@@ -36,7 +36,9 @@ def active_backend(config: LLMConfig) -> str:
     if config.provider in {"codex-cli", "codex_cli", "codex"}:
         return "codex-cli"
     profile = profiles.resolve(config.base_url)
-    return "openrouter" if profile.get("name") == "openrouter" else "openai-compatible"
+    if profile.get("name") in {"openrouter", "zai"}:
+        return profile["name"]
+    return "openai-compatible"
 
 
 def _norm(model_id: str) -> str:
@@ -50,7 +52,7 @@ async def _fetch_openai_style(config: LLMConfig, tools_only: bool) -> list[dict]
     tool-calling models — Mira's review pass needs tool calling."""
     headers = {}
     try:
-        key = _get_api_key(config)
+        key = _get_api_key(config, profiles.resolve(config.base_url))
     except Exception as exc:
         logger.warning("Could not retrieve API key for model catalog fetch: %s", exc)
         key = ""
@@ -101,7 +103,10 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
     backend = active_backend(config)
     if backend == "bedrock":
         cache_key = f"bedrock:{config.region}:{config.aws_profile or ''}"
-    elif backend == "codex-cli":
+    elif backend in {"codex-cli", "zai"}:
+        # These backends use a curated static catalog. Codex CLI has no model
+        # list API; Z.AI's general API documents Chat Completions but no
+        # OpenAI-style /models endpoint.
         return None
     else:
         cache_key = config.base_url
@@ -138,7 +143,9 @@ def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> lis
 
     Dynamic-only models have unknown capabilities, so they're offered for both
     purposes. On a generic endpoint only its own list is trustworthy — registry
-    ids are OpenRouter-style — so the registry is used there only as fallback.
+    ids are mostly OpenRouter-style — so the registry is used there only as
+    fallback. Z.AI intentionally uses its curated catalog rather than exposing
+    unvalidated models from a dynamic response.
     """
     if backend == "openai-compatible" and dynamic is not None:
         options = [{**d, "recommended": False} for d in dynamic]
@@ -146,13 +153,12 @@ def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> lis
         return options
 
     options = []
+    isolated_backends = {"bedrock", "codex-cli", "zai"}
     for model_id, info in registry.all_models().items():
         provider = info.get("provider")
-        if backend == "bedrock" and provider != "bedrock":
+        if backend in isolated_backends and provider != backend:
             continue
-        if backend == "codex-cli" and provider != "codex-cli":
-            continue
-        if backend not in {"bedrock", "codex-cli"} and provider in {"bedrock", "codex-cli"}:
+        if backend not in isolated_backends and provider in isolated_backends:
             continue
         if purpose not in (info.get("purposes") or []):
             continue
@@ -163,7 +169,7 @@ def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> lis
                 "recommended": purpose in (info.get("recommended_for") or []),
             }
         )
-    if dynamic is not None:
+    if dynamic is not None and backend != "zai":
         seen = {_norm(o["value"]) for o in options}
         options += [{**d, "recommended": False} for d in dynamic if _norm(d["value"]) not in seen]
     options.sort(key=lambda m: (not m["recommended"], m["label"].lower()))

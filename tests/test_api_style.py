@@ -18,6 +18,7 @@ from mira.dashboard.api import ModelsUpdate
 from mira.dashboard.db import AppDatabase
 from mira.dashboard.models_config import (
     API_STYLE_VALUES,
+    api_styles_for,
     llm_config_for,
     resolve_api_style,
 )
@@ -64,6 +65,11 @@ class TestResolveApiStyle:
     def test_db_responses_wins_over_config_chat(self):
         cfg = LLMConfig(api_style="chat")
         assert resolve_api_style(cfg, "responses") == "responses"
+
+    def test_zai_profile_rejects_responses_style(self):
+        cfg = LLMConfig(base_url="https://api.z.ai/api/paas/v4", api_style="responses")
+        assert resolve_api_style(cfg, "responses") == "chat"
+        assert api_styles_for(cfg) == [{"value": "chat", "label": "Chat Completions"}]
 
 
 class TestLLMConfigFor:

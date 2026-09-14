@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from mira.config import LLMConfig
+from mira.llm import provider_profiles as profiles
 from mira.llm import registry
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,19 @@ API_STYLE_VALUES = {m["value"] for m in API_STYLES}
 
 
 def resolve_api_style(config: LLMConfig, db_value: str | None = None) -> str:
-    """Resolve the API protocol: DB → config.api_style → "chat"."""
-    if db_value and db_value in API_STYLE_VALUES:
+    """Resolve the API protocol: DB → config.api_style → provider default."""
+    supported = profiles.resolve(config.base_url).get("api_styles", ["chat", "responses"])
+    if db_value and db_value in API_STYLE_VALUES and db_value in supported:
         return db_value
-    return config.api_style if config.api_style in API_STYLE_VALUES else "chat"
+    if config.api_style in API_STYLE_VALUES and config.api_style in supported:
+        return config.api_style
+    return supported[0] if supported else "chat"
+
+
+def api_styles_for(config: LLMConfig) -> list[dict[str, str]]:
+    """Dashboard protocol options supported by the configured endpoint."""
+    supported = set(profiles.resolve(config.base_url).get("api_styles", ["chat", "responses"]))
+    return [style for style in API_STYLES if style["value"] in supported]
 
 
 def estimate_indexing_cost(file_count: int, model: str) -> dict:
