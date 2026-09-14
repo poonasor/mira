@@ -14,12 +14,14 @@ import logging
 import os
 import shlex
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from mira.exceptions import LLMError
 from mira.llm.cli_base import CLIProviderBase
+from mira.llm.codex_auth import CodexAuthSync
 
 logger = logging.getLogger(__name__)
 
@@ -61,15 +63,22 @@ class CodexCLIProvider(CLIProviderBase):
         env["CODEX_HOME"] = runtime_codex_home
         return env
 
+    def _source_auth_path(self) -> Path | None:
+        """The operator's ``auth.json``, or None to let Codex use its defaults."""
+        source_home = self.config.codex_home or os.environ.get("CODEX_HOME")
+        if not source_home:
+            return None
+        source_auth = Path(source_home).expanduser() / "auth.json"
+        if not source_auth.is_file():
+            raise LLMError("codex_auth_file_missing", path=str(source_auth))
+        return source_auth
+
     def _prepare_codex_home(self, invocation_root: str) -> str:
         """Create writable ephemeral Codex state containing only OAuth auth."""
         destination = Path(invocation_root) / "codex-home"
         destination.mkdir(parents=True, mode=0o700)
-        source_home = self.config.codex_home or os.environ.get("CODEX_HOME")
-        if source_home:
-            source_auth = Path(source_home).expanduser() / "auth.json"
-            if not source_auth.is_file():
-                raise LLMError("codex_auth_file_missing", path=str(source_auth))
+        source_auth = self._source_auth_path()
+        if source_auth:
             destination_auth = destination / "auth.json"
             destination_auth.write_bytes(source_auth.read_bytes())
             destination_auth.chmod(0o600)
@@ -115,50 +124,67 @@ class CodexCLIProvider(CLIProviderBase):
     )
     async def _run_codex(self, prompt: str) -> str:
         with tempfile.TemporaryDirectory(prefix="mira-codex-") as tmpdir:
-            output_path = str(Path(tmpdir) / "last-message.txt")
-            runtime_home = str(Path(tmpdir) / "runtime")
-            Path(runtime_home).mkdir(mode=0o700)
             runtime_codex_home = self._prepare_codex_home(tmpdir)
-            cmd = self._command(output_path)
-            logger.debug("Running Codex CLI provider: %s", shlex.join(cmd[:-1] + ["<stdin>"]))
+            source_auth = self._source_auth_path()
+            if source_auth is None:
+                return await self._exec_codex(prompt, tmpdir, runtime_codex_home)
+
+            # Codex rotates OAuth refresh tokens into the temporary copy; save them back.
+            auth_sync = CodexAuthSync(source_auth, Path(runtime_codex_home) / "auth.json")
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=self._env(runtime_home, runtime_codex_home),
-                    cwd=runtime_home,
-                    start_new_session=os.name == "posix",
-                )
-            except FileNotFoundError as exc:
-                raise LLMError(
-                    "codex_command_not_found", command=self.config.codex_command
-                ) from exc
+                await auth_sync.start(timedelta(seconds=self.config.codex_timeout_seconds))
+                watcher = asyncio.create_task(auth_sync.watch())
+                try:
+                    return await self._exec_codex(prompt, tmpdir, runtime_codex_home)
+                finally:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+            finally:
+                # Also after failed, timed-out, or cancelled runs: the refresh already happened.
+                auth_sync.close()
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(prompt.encode("utf-8")),
-                    timeout=self.config.codex_timeout_seconds,
-                )
-            except TimeoutError as exc:
-                await self._terminate_process_tree(proc)
-                raise LLMError("codex_timeout", seconds=self.config.codex_timeout_seconds) from exc
-            except BaseException:
-                await self._terminate_process_tree(proc)
-                raise
+    async def _exec_codex(self, prompt: str, tmpdir: str, runtime_codex_home: str) -> str:
+        output_path = str(Path(tmpdir) / "last-message.txt")
+        runtime_home = str(Path(tmpdir) / "runtime")
+        Path(runtime_home).mkdir(mode=0o700)
+        cmd = self._command(output_path)
+        logger.debug("Running Codex CLI provider: %s", shlex.join(cmd[:-1] + ["<stdin>"]))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._env(runtime_home, runtime_codex_home),
+                cwd=runtime_home,
+                start_new_session=os.name == "posix",
+            )
+        except FileNotFoundError as exc:
+            raise LLMError("codex_command_not_found", command=self.config.codex_command) from exc
 
-            stdout_text = stdout.decode("utf-8", errors="replace")
-            stderr_text = stderr.decode("utf-8", errors="replace")
-            output_file = Path(output_path)
-            last_message = output_file.read_text(encoding="utf-8") if output_file.exists() else ""
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(prompt.encode("utf-8")),
+                timeout=self.config.codex_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            await self._terminate_process_tree(proc)
+            raise LLMError("codex_timeout", seconds=self.config.codex_timeout_seconds) from exc
+        except BaseException:
+            await self._terminate_process_tree(proc)
+            raise
 
-            if proc.returncode != 0:
-                detail = (stderr_text or stdout_text or last_message).strip()
-                raise LLMError(
-                    "codex_exit_failed",
-                    exit_code=proc.returncode,
-                    detail=detail[-2000:],
-                )
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        output_file = Path(output_path)
+        last_message = output_file.read_text(encoding="utf-8") if output_file.exists() else ""
 
-            return (last_message or stdout_text).strip()
+        if proc.returncode != 0:
+            detail = (stderr_text or stdout_text or last_message).strip()
+            raise LLMError(
+                "codex_exit_failed",
+                exit_code=proc.returncode,
+                detail=detail[-2000:],
+            )
+
+        return (last_message or stdout_text).strip()

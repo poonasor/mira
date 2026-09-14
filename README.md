@@ -159,12 +159,15 @@ llm:
   codex_timeout_seconds: 900  # optional
 ```
 
-The official Mira image includes a pinned Codex CLI. Mount a Codex login read-only:
+The official Mira image includes a pinned Codex CLI. Log in to a directory that
+only Mira uses, then mount that directory writable so Mira can save refreshed
+tokens (see [Keeping the Codex login fresh](#keeping-the-codex-login-fresh)):
 
 ```bash
+CODEX_HOME="$(pwd)/codex-home" codex login
 docker run -p 8000:8000 --env-file .env \
   -e CODEX_HOME=/run/codex \
-  -v "$HOME/.codex:/run/codex:ro" \
+  -v "$(pwd)/codex-home:/run/codex" \
   -v "$(pwd)/mira.yaml:/app/mira.yaml:ro" \
   ghcr.io/miracodeai/mira:latest --config /app/mira.yaml
 ```
@@ -193,7 +196,9 @@ prompt-injected model and gives it no way to act beyond writing its answer:
   only `auth.json` from the mount into a private temporary Codex home, runs
   Codex in an empty temporary workspace with an allow-listed environment (no
   Mira, GitHub, or database credentials), and discards both afterwards
-  (`--ephemeral`).
+  (`--ephemeral`). The only thing that flows back is a refreshed login, saved
+  to the mounted `auth.json` (see
+  [Keeping the Codex login fresh](#keeping-the-codex-login-fresh)).
 - **No writes.** The `read-only` sandbox stays on as a second layer.
 
 What these guarantees do **not** cover:
@@ -208,7 +213,6 @@ What these guarantees do **not** cover:
   in depth.
 - The prompt, including pull-request content and Mira's instructions, is sent
   to OpenAI, and the model can put any of it in its answer.
-
 Provider choice, executable/auth paths, sandbox policy, and timeout are
 deployment-only settings; repository `.mira.yaml` files cannot override them.
 For one-shot `mira review` runs, `--config` is treated as untrusted by default.
@@ -219,6 +223,41 @@ Codex CLI does not expose Mira's temperature or hard output-token controls, so
 Mira disables ensemble sampling for this provider. The mounted OAuth session is
 still a sensitive deployment credential: use a dedicated Codex account/session
 and isolate the Mira container from unrelated host files and services.
+
+#### Keeping the Codex login fresh
+
+A ChatGPT login in `auth.json` holds an access token and a single-use refresh
+token. Codex refreshes the login shortly before the access token expires
+(currently every 10 days) and writes the new tokens to its own `auth.json`,
+which for Mira is the temporary copy. Mira saves that refresh back to the
+mounted `auth.json`:
+
+- **As soon as it happens.** Mira checks the copy every second while Codex runs
+  and once more after Codex exits, including runs that fail, time out, or are
+  cancelled. Nothing else from the temporary Codex home is written back.
+- **Only if it is newer.** The copy is saved only when it changed, parses as a
+  login for the same account as the mounted file, and has a later
+  `last_refresh` than the mounted file. A login that another run saved later,
+  or a login for a different account, is never overwritten.
+- **Atomically, under a lock.** Mira holds an exclusive lock on
+  `.mira-auth.lock` while it compares and replaces `auth.json`: it writes a
+  temporary file with mode `0600` and renames it over the old one.
+- **One refresh at a time.** A run whose access token could expire before
+  `codex_timeout_seconds` elapse first takes `.mira-auth-refresh.lock`. Other
+  such runs wait (for at most that timeout) and then start from the refreshed
+  login instead of spending the same refresh token again. Runs with a fresh
+  token never wait.
+
+The mounted *directory* must be writable, because Mira replaces `auth.json` by
+renaming and creates its lock files next to it. A read-only mount, or a mount of
+the `auth.json` file alone, still works for an API-key login, but a ChatGPT
+login breaks at its first refresh: Mira logs `Codex refreshed its login but Mira
+could not save it`, and later runs fail with "refresh token was already used".
+To recover, run `CODEX_HOME=<mounted dir> codex login` again.
+
+Don't mount your personal `~/.codex`. The container could read and change your
+other Codex state, and your own Codex sessions don't take Mira's lock, so they
+can spend the same refresh token as Mira.
 
 ### Claude CLI failover
 
