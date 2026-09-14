@@ -23,6 +23,26 @@ from mira.llm.cli_base import CLIProviderBase
 
 logger = logging.getLogger(__name__)
 
+# The prompt carries untrusted pull-request content, and the read-only sandbox
+# blocks writes but not reads, so every Codex tool that can run commands, read
+# files, reach the network, or start other agents is switched off. `--disable`
+# rejects unknown feature names, so a Codex release that drops one of these fails
+# the review loudly instead of silently re-enabling a tool.
+_DISABLED_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "view_image",
+    "multi_agent",
+    "multi_agent_v2",
+    "code_mode",
+    "apps",
+    "plugins",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+    "hooks",
+)
+
 
 class CodexCLIProvider(CLIProviderBase):
     """LLM provider that shells out to OpenAI Codex CLI.
@@ -76,6 +96,9 @@ class CodexCLIProvider(CLIProviderBase):
             "-c",
             'shell_environment_policy.inherit="none"',
         ]
+        for feature in _DISABLED_FEATURES:
+            cmd.extend(["--disable", feature])
+        cmd.extend(["-c", 'web_search="disabled"'])
         if self.config.model not in {"", "default", "codex-default"}:
             cmd.extend(["-m", self.config.model])
         cmd.append("-")

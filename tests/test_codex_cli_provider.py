@@ -40,6 +40,32 @@ class TestCodexCLIProvider:
             "--ignore-rules",
             "-c",
             'shell_environment_policy.inherit="none"',
+            "--disable",
+            "shell_tool",
+            "--disable",
+            "unified_exec",
+            "--disable",
+            "view_image",
+            "--disable",
+            "multi_agent",
+            "--disable",
+            "multi_agent_v2",
+            "--disable",
+            "code_mode",
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "--disable",
+            "browser_use",
+            "--disable",
+            "computer_use",
+            "--disable",
+            "image_generation",
+            "--disable",
+            "hooks",
+            "-c",
+            'web_search="disabled"',
             "-m",
             "gpt-5-codex",
             "-",
@@ -99,6 +125,43 @@ class TestCodexCLIProvider:
         assert "--ignore-user-config" in cmd
         assert "--ignore-rules" in cmd
         assert 'shell_environment_policy.inherit="none"' in cmd
+
+    def test_command_disables_tools_that_can_read_files_or_run_commands(self):
+        # The read-only sandbox blocks writes, not reads; a prompt-injected model
+        # must have no tool that can reach /run/secrets or CODEX_HOME.
+        provider = CodexCLIProvider(LLMConfig(provider="codex-cli", model="gpt-5-codex"))
+
+        cmd = provider._command("/tmp/out.txt")
+
+        disabled = {cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--disable"}
+        assert {
+            "shell_tool",
+            "unified_exec",
+            "view_image",
+            "multi_agent",
+            "multi_agent_v2",
+            "code_mode",
+            "apps",
+            "plugins",
+            "browser_use",
+            "computer_use",
+            "image_generation",
+            "hooks",
+        } <= disabled
+        assert 'web_search="disabled"' in cmd
+        assert cmd.index("--disable") < cmd.index("-")
+
+    def test_command_never_reenables_tools_or_bypasses_the_sandbox(self):
+        provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
+
+        cmd = provider._command("/tmp/out.txt")
+
+        assert "--enable" not in cmd
+        assert not any(arg.startswith("features.") for arg in cmd)
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+        assert "--dangerously-bypass-hook-trust" not in cmd
+        assert "--add-dir" not in cmd
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only"
 
     def test_extracts_fenced_json(self):
         provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
