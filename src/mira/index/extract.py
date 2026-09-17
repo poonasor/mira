@@ -67,6 +67,14 @@ _JAVA_CLASS = re.compile(
 )
 _JAVA_CTOR = re.compile(r"^(\s*)(?:public|private|protected)\s+(\w+)\s*\(")
 
+# Erlang patterns. Functions are `name(Args) ->` clauses; headers (.hrl) carry
+# -define macros and -record declarations instead. Directives like -module and
+# -export are not symbols.
+_ERL_CLAUSE = re.compile(r"^(\w+)\s*\([^)]*\)\s*->")
+_ERL_DEFINE = re.compile(r"^-define\(\s*([A-Za-z0-9_]+)")
+_ERL_RECORD = re.compile(r"^-record\(\s*(\w+)")
+_ERL_DIRECTIVE = re.compile(r"^-")
+
 
 @dataclass
 class SymbolSpan:
@@ -95,6 +103,9 @@ def extract_symbols(source: str, language: str) -> list[SymbolSpan]:
     if not source.strip():
         return []
 
+    lang = language.lower().strip()
+    if lang in _ERLANG_LANGUAGES:
+        return _extract_erlang(source)
     style = _detect_style(source, language)
     if style == "indentation":
         return _extract_indentation_based(source)
@@ -202,6 +213,117 @@ def _extract_brace_based(source: str, language: str) -> list[SymbolSpan]:
         return _extract_java(lines)
     # Default: JS/TS/C-like
     return _extract_js_ts(lines)
+
+
+_ERLANG_LANGUAGES = {"erlang", "erl", "hrl"}
+
+
+def _extract_erlang(source: str) -> list[SymbolSpan]:
+    """Extract symbols from Erlang modules and headers.
+
+    Erlang has no braces: a function spans from its ``name(Args) ->`` clause
+    until the next top-level clause or directive. Headers (.hrl) contribute
+    ``-define`` macros and ``-record`` declarations (single-line spans).
+    """
+    lines = source.splitlines()
+    symbols: list[SymbolSpan] = []
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+
+        if not line.strip() or line.lstrip().startswith("%"):
+            i += 1
+            continue
+
+        clause = _ERL_CLAUSE.match(line)
+        if clause:
+            # Span runs until the next top-level clause/directive.
+            end = i + 1
+            while end < n:
+                nxt = lines[end]
+                if not nxt.strip():
+                    # Blank line: include it but keep scanning.
+                    end += 1
+                    continue
+                if _ERL_CLAUSE.match(nxt) or _ERL_DIRECTIVE.match(nxt):
+                    break
+                end += 1
+            # Trim trailing blank lines out of the span.
+            last = end
+            while last > i + 1 and not lines[last - 1].strip():
+                last -= 1
+            symbols.append(
+                SymbolSpan(
+                    name=f"{clause.group(1)}/{_clause_arity(line)}",
+                    kind="function",
+                    start_line=i + 1,
+                    end_line=last,
+                    source="\n".join(lines[i:last]),
+                )
+            )
+            i = end
+            continue
+
+        define = _ERL_DEFINE.match(line)
+        if define:
+            symbols.append(
+                SymbolSpan(
+                    name=define.group(1),
+                    kind="macro",
+                    start_line=i + 1,
+                    end_line=_directive_end(lines, i, n),
+                    source="",
+                )
+            )
+            i += 1
+            continue
+
+        record = _ERL_RECORD.match(line)
+        if record:
+            end = _directive_end(lines, i, n)
+            symbols.append(
+                SymbolSpan(
+                    name=record.group(1),
+                    kind="record",
+                    start_line=i + 1,
+                    end_line=end,
+                    source="\n".join(lines[i:end]),
+                )
+            )
+            i = end
+            continue
+
+        i += 1
+
+    return symbols
+
+
+def _clause_arity(clause_line: str) -> int:
+    """Arity of a function clause = commas at depth 0 inside the parens + 1."""
+    open_idx = clause_line.index("(")
+    close_idx = clause_line.rindex(")")
+    depth = 0
+    arity = 1
+    for ch in clause_line[open_idx : close_idx + 1]:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 1:
+            arity += 1
+    return arity
+
+
+def _directive_end(lines: list[str], start: int, n: int) -> int:
+    """Last line (exclusive) of a directive that may span multiple lines
+    (e.g. a -record with fields) — ends at the line holding the final ``.``."""
+    for end in range(start, min(start + 50, n)):
+        stripped = lines[end].rstrip()
+        if stripped.endswith(".") and "%" not in stripped.split(".")[-1]:
+            return end + 1
+    return min(start + 1, n)
 
 
 def _extract_js_ts(lines: list[str]) -> list[SymbolSpan]:
