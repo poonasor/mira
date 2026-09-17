@@ -64,6 +64,7 @@ class ForgejoProvider(BaseProvider):
             raise ProviderError("Forgejo token is required")
         self._token = token
         self._api = profiles.resolve("forgejo")["api_url"] or "https://codeberg.org/api/v1"
+        self._base = profiles.resolve("forgejo").get("base_url") or "https://codeberg.org"
         self._username: str | None = None
 
     # ── low-level HTTP ──────────────────────────────────────────────
@@ -73,6 +74,9 @@ class ForgejoProvider(BaseProvider):
 
     def _pr(self, pr_info: PRInfo) -> str:
         return f"{self._repo(pr_info)}/pulls/{pr_info.number}"
+
+    def _repo_owner(self, pr_info: PRInfo) -> str:
+        return f"{self._base}/{quote(pr_info.owner, safe='')}/{quote(pr_info.repo, safe='')}"
 
     async def _request(
         self, method: str, url: str, *, ok: tuple[int, ...] = (200, 201), **kw: Any
@@ -158,7 +162,7 @@ class ForgejoProvider(BaseProvider):
         if base_sha == head_sha or not base_sha or not head_sha:
             return ""
         url = (
-            f"{self._repo(pr_info)}/compare/{quote(base_sha, safe='')}"
+            f"{self._repo_owner(pr_info)}/compare/{quote(base_sha, safe='')}"
             f"..."
             f"{quote(head_sha, safe='')}.diff"
         )
