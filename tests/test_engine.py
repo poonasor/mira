@@ -163,6 +163,58 @@ class TestReviewEngine:
         mock_provider.post_review.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_walkthrough_retries_corrupted_response(
+        self, mock_provider: AsyncMock, sample_diff_text: str
+    ):
+        """A corrupted walkthrough LLM response (invalid JSON tool-call args)
+        is retried up to 3 times instead of dropping the walkthrough."""
+        llm = MagicMock(spec=LLMProvider)
+        responses = [
+            "NOT VALID JSON {{{",  # corrupted tool-call arguments
+            '{"summary": "ok", "change_groups": []}',
+        ]
+        llm.walkthrough = AsyncMock(side_effect=responses)
+        llm.review = AsyncMock(
+            return_value=json.dumps(
+                {"comments": [], "summary": "ok", "metadata": {"reviewed_files": 1}}
+            )
+        )
+        llm.complete = AsyncMock(return_value="{}")
+        llm.count_tokens = MagicMock(return_value=100)
+        llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+        result = await engine.review_diff(sample_diff_text)
+
+        assert llm.walkthrough.await_count == 2
+        assert result.walkthrough is not None
+        assert result.walkthrough.summary == "ok"
+
+    @pytest.mark.asyncio
+    async def test_walkthrough_gives_up_after_max_attempts(
+        self, mock_provider: AsyncMock, sample_diff_text: str
+    ):
+        """All 3 walkthrough attempts failing leaves walkthrough=None but the
+        review itself still completes."""
+        llm = MagicMock(spec=LLMProvider)
+        llm.walkthrough = AsyncMock(return_value="NOT VALID JSON {{{")
+        llm.review = AsyncMock(
+            return_value=json.dumps(
+                {"comments": [], "summary": "ok", "metadata": {"reviewed_files": 1}}
+            )
+        )
+        llm.complete = AsyncMock(return_value="{}")
+        llm.count_tokens = MagicMock(return_value=100)
+        llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+        result = await engine.review_diff(sample_diff_text)
+
+        assert llm.walkthrough.await_count == 3
+        assert result.walkthrough is None
+        assert result.reviewed_files > 0
+
+    @pytest.mark.asyncio
     async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):
         llm = MagicMock(spec=LLMProvider)
         no_comments = json.dumps(
