@@ -1134,9 +1134,33 @@ class ReviewEngine:
                     pr_title=pr_title,
                     pr_description=pr_description,
                 )
-                wt_raw = await self.llm.walkthrough(wt_messages)
-                wt_parsed = parse_walkthrough_response(wt_raw)
-                return convert_to_walkthrough_result(wt_parsed)
+                # The walkthrough LLM intermittently returns corrupted tool-call
+                # arguments (mid-string token glitches) that no JSON repair pass
+                # can fix. One bad sample used to drop the walkthrough for the
+                # whole run, so retry the generate→parse pair a few times before
+                # giving up; prompt building stays outside the loop.
+                walkthrough_attempts = 3
+                last_walkthrough_error: Exception | None = None
+                for attempt in range(1, walkthrough_attempts + 1):
+                    try:
+                        wt_raw = await self.llm.walkthrough(wt_messages)
+                        wt_parsed = parse_walkthrough_response(wt_raw)
+                    except Exception as exc:
+                        last_walkthrough_error = exc
+                        logger.warning(
+                            "Walkthrough attempt %d/%d failed: %s",
+                            attempt,
+                            walkthrough_attempts,
+                            exc,
+                        )
+                        continue
+                    return convert_to_walkthrough_result(wt_parsed)
+                logger.warning(
+                    "Walkthrough generation failed after %d attempts, skipping: %s",
+                    walkthrough_attempts,
+                    last_walkthrough_error,
+                )
+                return None
             except Exception as exc:
                 logger.warning("Walkthrough generation failed, skipping: %s", exc)
                 return None
