@@ -162,9 +162,7 @@ class LLMProvider(OpenAICompatibleProvider):
         content = message.get("content") or ""
         if content:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return validate_tool_arguments(
-                content, provider=self.config.provider, model=api_model
-            )
+            return validate_tool_arguments(content, provider=self.config.provider, model=api_model)
 
         raise LLMError("no_tool_call")
 

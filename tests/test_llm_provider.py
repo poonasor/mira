@@ -896,9 +896,7 @@ class TestMalformedToolArguments:
     async def test_corrupted_content_fallback_also_raises(self):
         provider = LLMProvider(LLMConfig(model="glm-5.2"))
         # Content fallback path: no tool_calls, prose content instead.
-        bad = _mock_httpx_response(
-            {"choices": [{"message": {"content": "NOT JSON {{{"}}]}
-        )
+        bad = _mock_httpx_response({"choices": [{"message": {"content": "NOT JSON {{{"}}]})
 
         with (
             patch("mira.llm.provider.httpx.AsyncClient") as cls,
@@ -926,9 +924,7 @@ class TestMalformedToolArguments:
     async def test_lenient_repair_still_salvages_minor_damage(self):
         provider = LLMProvider(LLMConfig(model="glm-5.2"))
         # Missing closing brace — the lenient repair pass balances it.
-        salvageable = _mock_httpx_response(
-            _make_tool_response_json('{"comments": []')
-        )
+        salvageable = _mock_httpx_response(_make_tool_response_json('{"comments": []'))
 
         with patch("mira.llm.provider.httpx.AsyncClient") as cls:
             cls.return_value = self._client([salvageable])

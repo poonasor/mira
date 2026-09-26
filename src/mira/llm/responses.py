@@ -17,8 +17,8 @@ import httpx
 from mira.config import LLMConfig
 from mira.exceptions import LLMError
 from mira.llm.base import OpenAICompatibleProvider, _strip_model_prefix
-from mira.llm.utils import _ensure_json_hint
 from mira.llm.response_parser import validate_tool_arguments
+from mira.llm.utils import _ensure_json_hint
 
 logger = logging.getLogger(__name__)
 
@@ -292,9 +292,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
         text = _output_text(data)
         if text:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return validate_tool_arguments(
-                text, provider=self.config.provider, model=api_model
-            )
+            return validate_tool_arguments(text, provider=self.config.provider, model=api_model)
 
         raise LLMError("no_tool_call")
 

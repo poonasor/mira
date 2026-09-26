@@ -139,9 +139,7 @@ class TestFailover:
         assert primary.calls == 2
 
     @pytest.mark.asyncio
-    async def test_malformed_tool_arguments_fail_over_without_cooldown(
-        self, clock: list[float]
-    ):
+    async def test_malformed_tool_arguments_fail_over_without_cooldown(self, clock: list[float]):
         """Corrupted tool-call arguments (glm's intermittent mid-string
         quote/brace permutation) are a request-scoped failure: the next tier
         serves the call and the tier is NOT cooled down — glm stays primary
