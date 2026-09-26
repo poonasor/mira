@@ -753,3 +753,49 @@ class TestOutputText:
 
         data = {"output": []}
         assert _output_text(data) == ""
+
+
+class TestMalformedToolArguments:
+    """Corrupted function_call ``arguments`` (the glm glitch family) must raise
+    a request-scoped LLMError on the Responses path too, so tiered failover
+    can act on it."""
+
+    _TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_review",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    @pytest.mark.asyncio
+    async def test_corrupted_arguments_raise(self, config: LLMConfig):
+        provider = ResponsesProvider(config)
+        corrupt = _make_resp_tool(
+            "submit_review",
+            '{"summary": "still unverified.},"effort":"{}',
+        )
+        mock_client = _mock_client(None, extra_posts=[_mock_httpx_response(corrupt, 200)])
+
+        with (
+            patch("mira.llm.responses.httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(LLMError),
+        ):
+            await provider.complete_with_tools(
+                [{"role": "user", "content": "review"}], tools=self._TOOLS
+            )
+
+    @pytest.mark.asyncio
+    async def test_valid_arguments_pass_through(self, config: LLMConfig):
+        provider = ResponsesProvider(config)
+        ok = _make_resp_tool("submit_review", '{"comments": []}')
+        mock_client = _mock_client(None, extra_posts=[_mock_httpx_response(ok, 200)])
+
+        with patch("mira.llm.responses.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.complete_with_tools(
+                [{"role": "user", "content": "review"}], tools=self._TOOLS
+            )
+
+        assert result == '{"comments": []}'

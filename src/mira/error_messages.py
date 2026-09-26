@@ -41,6 +41,13 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Model returned neither tool call nor content",
         safe="Model returned neither tool call nor content",
     ),
+    "malformed_tool_arguments": ErrorMessage(
+        full=(
+            "Model returned tool-call arguments that are not a valid JSON "
+            "object (even after lenient repair): {excerpt}"
+        ),
+        safe="Model returned malformed tool-call arguments",
+    ),
     "no_tools": ErrorMessage(
         full="tools list must not be empty",
         safe="tools list must not be empty",

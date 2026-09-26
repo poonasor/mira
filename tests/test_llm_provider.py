@@ -843,3 +843,97 @@ class TestReasoningFallback:
 
         assert len(posts) == 1  # no wasted reasoning attempt
         assert "reasoning" not in posts[0].kwargs["json"]
+
+
+class TestMalformedToolArguments:
+    """glm intermittently corrupts forced-tool-call ``arguments`` (a mid-string
+    quote/brace permutation that survives no JSON repair). The provider must
+    surface that as a request-scoped LLMError so TieredProvider fails over,
+    instead of returning the corrupt string for the caller to re-roll."""
+
+    _TOOL = {"type": "function", "function": {"name": "submit_review", "parameters": {}}}
+
+    def _client(self, responses):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=responses)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return mock_client
+
+    # Real corrupted sample from poonasor/picnstic#82 (2026-09-26): the model
+    # emitted `unverified.},"effort":{"}` where `unverified.", "effort": {}`
+    # was intended — the closing quote became a brace and a stray quote landed
+    # inside the braces.
+    _CORRUPT = (
+        '{"change_groups":[{"files": [{"change_type": "modified", '
+        '"description": "still unverified.},"effort":{}", "path": "a.tsx"}]}]}'
+    )
+
+    @pytest.mark.asyncio
+    async def test_corrupted_arguments_raise_malformed_error(self):
+        # max_retries=1: tenacity would otherwise re-roll the corrupt response
+        # (the error is deliberately retriable) and exhaust the mock's
+        # single-response side_effect.
+        provider = LLMProvider(LLMConfig(model="glm-5.2", max_retries=1))
+        bad = _mock_httpx_response(_make_tool_response_json(self._CORRUPT))
+
+        with (
+            patch("mira.llm.provider.httpx.AsyncClient") as cls,
+            pytest.raises(LLMError) as excinfo,
+        ):
+            cls.return_value = self._client([bad])
+            await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+        # The specific cause survives the tool_call_failed wrap; the tiered
+        # layer classifies failures by walking this chain.
+        cause = excinfo.value.__cause__
+        assert isinstance(cause, LLMError)
+        assert cause._code == "malformed_tool_arguments"
+
+    @pytest.mark.asyncio
+    async def test_corrupted_content_fallback_also_raises(self):
+        provider = LLMProvider(LLMConfig(model="glm-5.2"))
+        # Content fallback path: no tool_calls, prose content instead.
+        bad = _mock_httpx_response(
+            {"choices": [{"message": {"content": "NOT JSON {{{"}}]}
+        )
+
+        with (
+            patch("mira.llm.provider.httpx.AsyncClient") as cls,
+            pytest.raises(LLMError),
+        ):
+            cls.return_value = self._client([bad])
+            await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+    @pytest.mark.asyncio
+    async def test_valid_arguments_pass_through(self):
+        provider = LLMProvider(LLMConfig(model="glm-5.2"))
+        ok = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([ok])
+            result = await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+        assert result == '{"comments": []}'
+
+    @pytest.mark.asyncio
+    async def test_lenient_repair_still_salvages_minor_damage(self):
+        provider = LLMProvider(LLMConfig(model="glm-5.2"))
+        # Missing closing brace — the lenient repair pass balances it.
+        salvageable = _mock_httpx_response(
+            _make_tool_response_json('{"comments": []')
+        )
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([salvageable])
+            result = await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+        assert result == '{"comments": []'

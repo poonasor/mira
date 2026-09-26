@@ -18,6 +18,7 @@ from mira.llm.base import (
     OpenAICompatibleProvider,
     _strip_model_prefix,
 )
+from mira.llm.response_parser import validate_tool_arguments
 from mira.llm.utils import _ensure_json_hint
 
 logger = logging.getLogger(__name__)
@@ -146,14 +147,24 @@ class LLMProvider(OpenAICompatibleProvider):
         tool_calls = message.get("tool_calls")
 
         if tool_calls and len(tool_calls) > 0:
-            return tool_calls[0]["function"]["arguments"]
+            arguments = tool_calls[0]["function"]["arguments"]
+            # Some backends intermittently corrupt the arguments (mid-string
+            # quote/brace permutations). Validate before returning so the
+            # corruption is a request-scoped LLMError the tiered failover
+            # layer can act on, instead of a parse error the caller can only
+            # re-roll on the same model.
+            return validate_tool_arguments(
+                arguments, provider=self.config.provider, model=api_model
+            )
 
         # Fallback: if the model returned content instead of a tool call,
         # return the content as-is (some models may not support tool calling)
         content = message.get("content") or ""
         if content:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return content
+            return validate_tool_arguments(
+                content, provider=self.config.provider, model=api_model
+            )
 
         raise LLMError("no_tool_call")
 
