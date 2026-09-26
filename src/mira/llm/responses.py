@@ -17,6 +17,7 @@ import httpx
 from mira.config import LLMConfig
 from mira.exceptions import LLMError
 from mira.llm.base import OpenAICompatibleProvider, _strip_model_prefix
+from mira.llm.response_parser import validate_tool_arguments
 from mira.llm.utils import _ensure_json_hint
 
 logger = logging.getLogger(__name__)
@@ -280,13 +281,18 @@ class ResponsesProvider(OpenAICompatibleProvider):
         output = data.get("output", [])
         for item in output:
             if item.get("type") == "function_call":
-                return item.get("arguments") or "{}"
+                arguments = item.get("arguments") or "{}"
+                # Same corruption guard as the chat path — validate before
+                # returning so tiered failover can act on the failure.
+                return validate_tool_arguments(
+                    arguments, provider=self.config.provider, model=api_model
+                )
 
         # Fallback: text content
         text = _output_text(data)
         if text:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return text
+            return validate_tool_arguments(text, provider=self.config.provider, model=api_model)
 
         raise LLMError("no_tool_call")
 

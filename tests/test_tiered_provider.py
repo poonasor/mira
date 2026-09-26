@@ -139,6 +139,27 @@ class TestFailover:
         assert primary.calls == 2
 
     @pytest.mark.asyncio
+    async def test_malformed_tool_arguments_fail_over_without_cooldown(self, clock: list[float]):
+        """Corrupted tool-call arguments (glm's intermittent mid-string
+        quote/brace permutation) are a request-scoped failure: the next tier
+        serves the call and the tier is NOT cooled down — glm stays primary
+        for subsequent requests."""
+        corrupt = LLMError(
+            "malformed_tool_arguments",
+            provider="openai",
+            model="glm-5.2",
+            excerpt='{"summary": "still unverified.},"effort":"{}',
+        )
+        primary, secondary = FakeProvider(error=corrupt), FakeProvider(result="from claude")
+        provider = pair(primary, secondary)
+
+        assert await provider.review(MESSAGES) == "from claude"
+        assert await provider.review(MESSAGES) == "from claude"
+
+        assert primary.calls == 2  # glm still tried first on the second call
+        assert provider.last_tier == "tier 2 (claude-cli:sonnet)"
+
+    @pytest.mark.asyncio
     async def test_primary_serves_while_healthy(self, clock: list[float]):
         primary, secondary = FakeProvider(result="from zai"), FakeProvider(result="from claude")
         provider = pair(primary, secondary)

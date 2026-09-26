@@ -9,7 +9,7 @@ import re
 from pydantic import BaseModel, Field, ValidationError
 
 from mira.core.context import extract_hunk_lines
-from mira.exceptions import ResponseParseError
+from mira.exceptions import LLMError, ResponseParseError
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 from mira.models import (
     FileChangeType,
@@ -109,6 +109,36 @@ def loads_lenient(text: str) -> object | None:
         except (json.JSONDecodeError, TypeError):
             continue
     return None
+
+
+def validate_tool_arguments(raw: str, *, provider: str, model: str) -> str:
+    """Validate that a tool-call ``arguments`` payload parses as a JSON object.
+
+    Some chat backends (observed: z.ai glm intermittently, roughly 1-in-6
+    forced-tool-call responses) emit corrupted ``arguments`` — a mid-string
+    quote/brace permutation that no JSON repair pass can fix. The HTTP call
+    still succeeds, so without this check the corruption is invisible to the
+    tiered failover layer and surfaces later as a ``ResponseParseError`` that
+    can only re-roll the same model.
+
+    Returns ``raw`` unchanged when it parses as a JSON object (the parse runs
+    on a cleaned copy so ``<think>``/fence stripping can't mangle the returned
+    bytes); otherwise raises ``LLMError("malformed_tool_arguments")`` — a
+    request-scoped failure, so ``TieredProvider`` fails over to the next tier
+    without a cooldown, and tenacity re-rolls the same tier first (the
+    corruption is stochastic).
+    """
+    cleaned = strip_code_fences(strip_think_blocks(raw))
+    data = loads_lenient(cleaned)
+    if not isinstance(data, dict):
+        excerpt = cleaned[:200].replace("\n", "\\n")
+        raise LLMError(
+            "malformed_tool_arguments",
+            provider=provider,
+            model=model,
+            excerpt=excerpt,
+        )
+    return raw
 
 
 def parse_llm_response(raw_text: str) -> LLMReviewResponse:
