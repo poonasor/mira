@@ -1,9 +1,9 @@
 """OpenAI-compatible API provider with retry/fallback and tool calling support.
 
 Per-provider quirks (attribution headers, model-prefix policy, reasoning
-remapping) come from the profile registry in ``mira.llm.provider_profiles``, matched
-to the configured ``base_url``. OpenRouter is the one profile with quirks; any
-other OpenAI-compatible endpoint works off the portable default, no entry needed.
+remapping, and tool-choice constraints) come from the profile registry in
+``mira.llm.provider_profiles``, matched to the configured ``base_url``. Other
+OpenAI-compatible endpoints work off the portable default, no entry needed.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from mira.llm.base import (
     OpenAICompatibleProvider,
     _strip_model_prefix,
 )
+from mira.llm.response_parser import validate_tool_arguments
 from mira.llm.utils import _ensure_json_hint
 
 logger = logging.getLogger(__name__)
@@ -99,9 +100,9 @@ class LLMProvider(OpenAICompatibleProvider):
             "model": api_model,
             "messages": messages,
             "tools": tools,
-            # Force the one tool for structured args; models that reject a
-            # forced choice fall back to "auto" (handled on the 400 below).
-            "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
+            # Force the one tool for structured args when supported. Profiles
+            # can select "auto" up front; unknown rejections fall back below.
+            "tool_choice": self._tool_choice(api_model, forced_choice),
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
@@ -123,12 +124,16 @@ class LLMProvider(OpenAICompatibleProvider):
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
                 resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                resp.status_code == 400
+                and self._reasoning_is_enabled(body)
+                and any(term in resp.text.lower() for term in ("reasoning", "thinking"))
+            ):
                 # Reasoning effort unsupported on this model/endpoint — drop it
                 # and review without thinking instead of failing the review.
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                body.pop("reasoning", None)
+                self._disable_reasoning(body)
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
@@ -142,14 +147,22 @@ class LLMProvider(OpenAICompatibleProvider):
         tool_calls = message.get("tool_calls")
 
         if tool_calls and len(tool_calls) > 0:
-            return tool_calls[0]["function"]["arguments"]
+            arguments = tool_calls[0]["function"]["arguments"]
+            # Some backends intermittently corrupt the arguments (mid-string
+            # quote/brace permutations). Validate before returning so the
+            # corruption is a request-scoped LLMError the tiered failover
+            # layer can act on, instead of a parse error the caller can only
+            # re-roll on the same model.
+            return validate_tool_arguments(
+                arguments, provider=self.config.provider, model=api_model
+            )
 
         # Fallback: if the model returned content instead of a tool call,
         # return the content as-is (some models may not support tool calling)
         content = message.get("content") or ""
         if content:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return content
+            return validate_tool_arguments(content, provider=self.config.provider, model=api_model)
 
         raise LLMError("no_tool_call")
 
@@ -167,8 +180,9 @@ class LLMProvider(OpenAICompatibleProvider):
         """
         if not tools:
             raise LLMError("no_tools")
+        api_model = _strip_model_prefix(model, self.config.base_url)
         body: dict = {
-            "model": _strip_model_prefix(model, self.config.base_url),
+            "model": api_model,
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
@@ -183,6 +197,18 @@ class LLMProvider(OpenAICompatibleProvider):
                 headers=self._build_headers(),
                 json=body,
             )
+            if (
+                resp.status_code == 400
+                and self._reasoning_is_enabled(body)
+                and any(term in resp.text.lower() for term in ("reasoning", "thinking"))
+            ):
+                logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
+                self._no_reasoning.add(api_model)
+                self._disable_reasoning(body)
+                body["temperature"] = (
+                    temperature if temperature is not None else self.config.temperature
+                )
+                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
             self._handle_error(resp)
             data = resp.json()
 

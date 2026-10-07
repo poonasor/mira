@@ -16,6 +16,7 @@ PROTECTED = [
     ("/api/gitlab/repos", "POST", {"body": None}),
     ("/api/forgejo/sync", "POST", {}),
     ("/api/forgejo/repos", "POST", {"body": None}),
+    ("/api/settings/failover", "GET", {}),
     ("/api/settings/models", "PUT", {"body": None}),
     ("/api/uninstalls/{installation_id}/keep", "POST", {"installation_id": 1}),
     ("/api/uninstalls/{installation_id}/delete", "POST", {"installation_id": 1}),

@@ -23,3 +23,11 @@ def test_indexability_uses_the_shared_normalized_extensions():
     assert is_indexable_path("src/main.PY")
     assert is_indexable_path("schema.graphql")
     assert not is_indexable_path("README.md")
+
+
+def test_erlang_sources_are_indexable():
+    assert is_indexable_path("src/dht_crawler.erl")
+    assert is_indexable_path("include/dht_crawler.hrl")
+    assert language_from_path("src/dht_crawler.erl") == Language.ERLANG.value
+    assert language_from_path("include/dht_crawler.hrl") == Language.ERLANG.value
+    assert not is_indexable_path("ebin/dht_crawler.beam")

@@ -176,15 +176,38 @@ class OpenAICompatibleProvider:
         self._cached_headers = headers
         return dict(headers)
 
+    def _tool_choice(self, model: str, forced_choice: dict | str) -> dict | str:
+        """Return a forced tool choice when the endpoint supports it.
+
+        Some OpenAI-compatible endpoints only accept ``"auto"``. Known
+        endpoint constraints come from the provider profile; the per-model set
+        also remembers endpoints that rejected a forced choice at runtime.
+        """
+        if not self.profile.get("supports_forced_tool_choice", True):
+            return "auto"
+        if model in self._no_forced_tool_choice:
+            return "auto"
+        return forced_choice
+
     def _apply_reasoning(self, body: dict) -> None:
         """Enable extended thinking when a reasoning effort is configured.
 
-        The effort is passed via the unified ``reasoning.effort`` knob, after
-        any per-provider remap from the profile. Anthropic models reject a
-        custom ``temperature`` while thinking is on, so we drop it.
-        No-op when reasoning is off, keeping the request unchanged.
+        The portable shape is the nested ``reasoning.effort`` knob. Provider
+        profiles can select another wire shape; Z.AI uses a top-level
+        ``reasoning_effort`` plus ``thinking.type`` and defaults thinking on,
+        so Mira must explicitly disable it when the configured effort is off.
         """
         effort = self.config.reasoning_effort
+        style = self.profile.get("reasoning_style", "nested")
+        if style == "zai":
+            if not effort or effort == "off" or body.get("model") in self._no_reasoning:
+                body["thinking"] = {"type": "disabled"}
+                return
+            effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
+            body["thinking"] = {"type": "enabled"}
+            body["reasoning_effort"] = effort
+            return
+
         if not effort or effort == "off":
             return
         if body.get("model") in self._no_reasoning:
@@ -192,6 +215,20 @@ class OpenAICompatibleProvider:
         effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
         body["reasoning"] = {"effort": effort}
         body.pop("temperature", None)
+
+    def _reasoning_is_enabled(self, body: dict) -> bool:
+        """Whether the request body currently asks the endpoint to reason."""
+        if self.profile.get("reasoning_style") == "zai":
+            return body.get("thinking", {}).get("type") == "enabled"
+        return "reasoning" in body
+
+    def _disable_reasoning(self, body: dict) -> None:
+        """Rewrite a request body to disable its profile-specific reasoning."""
+        if self.profile.get("reasoning_style") == "zai":
+            body.pop("reasoning_effort", None)
+            body["thinking"] = {"type": "disabled"}
+            return
+        body.pop("reasoning", None)
 
     def _account_usage(self, data: dict) -> None:
         """Accumulate token counts. Default: chat/completions key names.

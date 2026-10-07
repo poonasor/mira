@@ -92,3 +92,37 @@ class TestLlmConfigForSecurity:
             config = llm_config_for("security", base)
 
         assert config.reasoning_effort == "medium"
+
+
+class TestLlmConfigForFailover:
+    """Dashboard overrides pick from the primary's catalog; the failover tier
+    resolves its own models from mira.yaml."""
+
+    def test_dashboard_override_applies_to_primary_only(self):
+        class _FakeDB:
+            def get_setting(self, key: str) -> str | None:
+                return {"review_model": "glm-5.2", "review_thinking_mode": "high"}.get(key)
+
+        base = LLMConfig(
+            model="glm-5.2",
+            failover=LLMConfig(provider="claude-cli", model="sonnet", review_model="opus"),
+        )
+        with patch("mira.dashboard.api._app_db", _FakeDB()):
+            config = llm_config_for("review", base)
+
+        assert config.model == "glm-5.2"
+        assert config.reasoning_effort == "high"
+        assert config.failover is not None
+        assert config.failover.model == "opus"
+        assert config.failover.reasoning_effort is None
+
+    def test_failover_resolves_its_own_indexing_model(self):
+        base = LLMConfig(
+            model="glm-5.2",
+            failover=LLMConfig(provider="claude-cli", model="sonnet", indexing_model="haiku"),
+        )
+        with patch("mira.dashboard.api._app_db", None):
+            config = llm_config_for("indexing", base)
+
+        assert config.failover is not None
+        assert config.failover.model == "haiku"

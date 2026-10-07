@@ -33,6 +33,15 @@ class TestShouldIndex:
     def test_lua_file(self):
         assert _should_index("src/main.lua") is True
 
+    def test_erlang_module_file(self):
+        assert _should_index("src/dht_crawler.erl") is True
+
+    def test_erlang_header_file(self):
+        assert _should_index("include/dht_crawler.hrl") is True
+
+    def test_erlang_compiled_beam_not_indexable(self):
+        assert _should_index("ebin/dht_crawler.beam") is False
+
     def test_lock_file(self):
         assert _should_index("package-lock.json") is False
 

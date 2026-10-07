@@ -598,6 +598,131 @@ class TestProfileHeaders:
         assert headers["Authorization"].startswith("Bearer ")
 
 
+class TestZAIProfile:
+    """Z.AI's OpenAI-compatible surface has a few stricter wire rules."""
+
+    _BASE_URL = "https://api.z.ai/api/paas/v4"
+    _TOOL = {"type": "function", "function": {"name": "submit_review", "parameters": {}}}
+
+    def _provider(self, reasoning_effort: str | None = None) -> LLMProvider:
+        return LLMProvider(
+            LLMConfig(
+                model="glm-5.2",
+                base_url=self._BASE_URL,
+                api_key_env="ZAI_API_KEY",
+                reasoning_effort=reasoning_effort,
+            )
+        )
+
+    def _client(self, responses):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=responses)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return mock_client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("effort", [None, "off"])
+    async def test_off_disables_thinking_and_uses_auto_tool_choice(
+        self, effort: str | None, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        provider = self._provider(effort)
+        ok = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([ok])
+            result = await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+            posts = cls.return_value.post.call_args_list
+
+        assert result == '{"comments": []}'
+        assert len(posts) == 1
+        assert posts[0].args[0] == f"{self._BASE_URL}/chat/completions"
+        assert posts[0].kwargs["headers"]["Authorization"] == "Bearer zai-test-key"
+        body = posts[0].kwargs["json"]
+        assert body["model"] == "glm-5.2"
+        assert body["tool_choice"] == "auto"
+        assert body["thinking"] == {"type": "disabled"}
+        assert "reasoning" not in body
+        assert "reasoning_effort" not in body
+
+    @pytest.mark.asyncio
+    async def test_reasoning_uses_zai_top_level_shape(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        provider = self._provider("max")
+        ok = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([ok])
+            await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+            body = cls.return_value.post.call_args.kwargs["json"]
+
+        assert body["tool_choice"] == "auto"
+        assert body["thinking"] == {"type": "enabled"}
+        assert body["reasoning_effort"] == "max"
+        assert "reasoning" not in body
+        assert body["temperature"] == provider.config.temperature
+
+    @pytest.mark.asyncio
+    async def test_agentic_reasoning_fallback_disables_zai_thinking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        provider = self._provider("max")
+        rejected = _mock_httpx_response(
+            {"error": {"message": "reasoning_effort not supported"}}, status_code=400
+        )
+        ok = _mock_httpx_response({"choices": [{"message": {"content": "done"}}]})
+        responses = iter([rejected, ok])
+        bodies: list[dict] = []
+
+        async def respond(*args, **kwargs):
+            # The provider intentionally mutates the request body for its retry;
+            # retain each body as it appeared when posted.
+            bodies.append(json.loads(json.dumps(kwargs["json"])))
+            return next(responses)
+
+        client = self._client([])
+        client.post = AsyncMock(side_effect=respond)
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = client
+            result = await provider.complete_agentic(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+        assert result == {"content": "done"}
+        assert bodies[0]["thinking"] == {"type": "enabled"}
+        assert bodies[0]["reasoning_effort"] == "max"
+        assert bodies[1]["thinking"] == {"type": "disabled"}
+        assert "reasoning_effort" not in bodies[1]
+        assert "glm-5.2" in provider._no_reasoning
+
+    def test_profile_supplies_key_env_and_auto_tool_choice(self, monkeypatch: pytest.MonkeyPatch):
+        # With no api_key_env configured, the matched profile's ZAI_API_KEY is
+        # used and a forced tool choice is downgraded before any request.
+        monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        provider = LLMProvider(LLMConfig(model="glm-5.2", base_url=self._BASE_URL))
+        forced = {"type": "function", "function": {"name": "submit_review"}}
+
+        assert provider.profile["name"] == "zai"
+        assert provider._build_headers()["Authorization"] == "Bearer zai-test-key"
+        assert provider._tool_choice("glm-5.2", forced) == "auto"
+
+
+class TestZAICodingPlanProfile(TestZAIProfile):
+    """Z.AI's Coding Plan endpoint speaks the same wire format as its general
+    API, so every inherited Z.AI test re-runs against this base URL."""
+
+    _BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+
+
 class TestToolChoiceFallback:
     """#82: thinking models (deepseek) 400 on a forced tool_choice; retry
     with "auto" rather than failing the review."""
@@ -718,3 +843,93 @@ class TestReasoningFallback:
 
         assert len(posts) == 1  # no wasted reasoning attempt
         assert "reasoning" not in posts[0].kwargs["json"]
+
+
+class TestMalformedToolArguments:
+    """glm intermittently corrupts forced-tool-call ``arguments`` (a mid-string
+    quote/brace permutation that survives no JSON repair). The provider must
+    surface that as a request-scoped LLMError so TieredProvider fails over,
+    instead of returning the corrupt string for the caller to re-roll."""
+
+    _TOOL = {"type": "function", "function": {"name": "submit_review", "parameters": {}}}
+
+    def _client(self, responses):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=responses)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return mock_client
+
+    # Real corrupted sample from poonasor/picnstic#82 (2026-09-26): the model
+    # emitted `unverified.},"effort":{"}` where `unverified.", "effort": {}`
+    # was intended — the closing quote became a brace and a stray quote landed
+    # inside the braces.
+    _CORRUPT = (
+        '{"change_groups":[{"files": [{"change_type": "modified", '
+        '"description": "still unverified.},"effort":{}", "path": "a.tsx"}]}]}'
+    )
+
+    @pytest.mark.asyncio
+    async def test_corrupted_arguments_raise_malformed_error(self):
+        # max_retries=1: tenacity would otherwise re-roll the corrupt response
+        # (the error is deliberately retriable) and exhaust the mock's
+        # single-response side_effect.
+        provider = LLMProvider(LLMConfig(model="glm-5.2", max_retries=1))
+        bad = _mock_httpx_response(_make_tool_response_json(self._CORRUPT))
+
+        with (
+            patch("mira.llm.provider.httpx.AsyncClient") as cls,
+            pytest.raises(LLMError) as excinfo,
+        ):
+            cls.return_value = self._client([bad])
+            await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+        # The specific cause survives the tool_call_failed wrap; the tiered
+        # layer classifies failures by walking this chain.
+        cause = excinfo.value.__cause__
+        assert isinstance(cause, LLMError)
+        assert cause._code == "malformed_tool_arguments"
+
+    @pytest.mark.asyncio
+    async def test_corrupted_content_fallback_also_raises(self):
+        provider = LLMProvider(LLMConfig(model="glm-5.2"))
+        # Content fallback path: no tool_calls, prose content instead.
+        bad = _mock_httpx_response({"choices": [{"message": {"content": "NOT JSON {{{"}}]})
+
+        with (
+            patch("mira.llm.provider.httpx.AsyncClient") as cls,
+            pytest.raises(LLMError),
+        ):
+            cls.return_value = self._client([bad])
+            await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+    @pytest.mark.asyncio
+    async def test_valid_arguments_pass_through(self):
+        provider = LLMProvider(LLMConfig(model="glm-5.2"))
+        ok = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([ok])
+            result = await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+        assert result == '{"comments": []}'
+
+    @pytest.mark.asyncio
+    async def test_lenient_repair_still_salvages_minor_damage(self):
+        provider = LLMProvider(LLMConfig(model="glm-5.2"))
+        # Missing closing brace — the lenient repair pass balances it.
+        salvageable = _mock_httpx_response(_make_tool_response_json('{"comments": []'))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([salvageable])
+            result = await provider.complete_with_tools(
+                [{"role": "user", "content": "hi"}], tools=[self._TOOL]
+            )
+
+        assert result == '{"comments": []'

@@ -188,6 +188,17 @@
     "purposes": ["indexing", "review"],
     "recommended_for": []
   },
+  "glm-5.2": {
+    "label": "GLM-5.2 (Z.AI)",
+    "provider": "zai",
+    "max_input_tokens": 1000000,
+    "max_output_tokens": 131072,
+    "input_cost_per_1m": 1.40,
+    "output_cost_per_1m": 4.40,
+    "supports_json_mode": true,
+    "purposes": ["indexing", "review"],
+    "recommended_for": []
+  },
   "codex-default": {
     "label": "Codex CLI default",
     "provider": "codex-cli",

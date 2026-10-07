@@ -17,6 +17,7 @@ import httpx
 from mira.config import LLMConfig
 from mira.exceptions import LLMError
 from mira.llm.base import OpenAICompatibleProvider, _strip_model_prefix
+from mira.llm.response_parser import validate_tool_arguments
 from mira.llm.utils import _ensure_json_hint
 
 logger = logging.getLogger(__name__)
@@ -238,7 +239,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "model": api_model,
             "input": _responses_input(messages),
             "tools": [_responses_tool(t) for t in tools],
-            "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
+            "tool_choice": self._tool_choice(api_model, forced_choice),
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }
@@ -259,10 +260,14 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
                 resp = await client.post(self._url, headers=self._build_headers(), json=body)
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                resp.status_code == 400
+                and self._reasoning_is_enabled(body)
+                and any(term in resp.text.lower() for term in ("reasoning", "thinking"))
+            ):
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                body.pop("reasoning", None)
+                self._disable_reasoning(body)
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
@@ -276,13 +281,18 @@ class ResponsesProvider(OpenAICompatibleProvider):
         output = data.get("output", [])
         for item in output:
             if item.get("type") == "function_call":
-                return item.get("arguments") or "{}"
+                arguments = item.get("arguments") or "{}"
+                # Same corruption guard as the chat path — validate before
+                # returning so tiered failover can act on the failure.
+                return validate_tool_arguments(
+                    arguments, provider=self.config.provider, model=api_model
+                )
 
         # Fallback: text content
         text = _output_text(data)
         if text:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return text
+            return validate_tool_arguments(text, provider=self.config.provider, model=api_model)
 
         raise LLMError("no_tool_call")
 
@@ -316,11 +326,15 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 headers=self._build_headers(),
                 json=body,
             )
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                resp.status_code == 400
+                and self._reasoning_is_enabled(body)
+                and any(term in resp.text.lower() for term in ("reasoning", "thinking"))
+            ):
                 api_model = _strip_model_prefix(model, self.config.base_url)
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                body.pop("reasoning", None)
+                self._disable_reasoning(body)
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )

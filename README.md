@@ -26,7 +26,7 @@ Mira reviews your pull requests using your choice of LLM (via [OpenRouter](https
 
 ## Why Teams Choose Mira
 
-- **Model agnostic** — Run Claude, GPT, Gemini, DeepSeek, Llama, or any OpenAI-compatible endpoint: OpenRouter, vLLM, Ollama, Together, Groq, Fireworks, or AWS Bedrock direct. Per-provider quirks are config, not code, so adding a provider is a one-line entry.
+- **Model agnostic** — Run Claude, GPT, Gemini, GLM, DeepSeek, Llama, or any OpenAI-compatible endpoint: OpenRouter, Z.AI, vLLM, Ollama, Together, Groq, Fireworks, or AWS Bedrock direct. Per-provider quirks are config, not code, so adding a provider is a one-line entry.
 - **Zero markup on LLM costs** — Bring your own key. You pay the model provider directly; Mira never proxies your spend or adds a multiplier. The dashboard shows real per-repo, per-model cost — not estimates.
 - **Learns from your context** — Mira synthesizes rules from your merged PRs: rejected comments and human review patterns become team rules that shape future reviews.
 - **You set the rules** — Define custom and org-wide review rules in plain language, per-repo via `.mira.yaml` or from the dashboard.
@@ -111,6 +111,38 @@ docker run -p 8000:8000 --env-file .env \
 
 → Full walkthrough: [creating the GitHub App & quickstart](https://docs.miracode.ai/quickstart) · [GitLab setup](https://docs.miracode.ai/gitlab) · [deploy options](https://docs.miracode.ai/deployment) · [choosing models, custom endpoints & AWS Bedrock](https://docs.miracode.ai/configuration/models)
 
+### Z.AI GLM
+
+Mira can call GLM-5.2 directly through Z.AI's OpenAI-compatible Chat
+Completions API. Set `base_url` to the endpoint for your Z.AI key:
+
+- General API key: `https://api.z.ai/api/paas/v4`
+- GLM Coding Plan key: `https://api.z.ai/api/coding/paas/v4`
+
+```yaml
+# mira.yaml
+llm:
+  provider: "openai"
+  api_style: "chat"
+  base_url: "https://api.z.ai/api/paas/v4"   # or https://api.z.ai/api/coding/paas/v4
+  api_key_env: "ZAI_API_KEY"
+  model: "glm-5.2"
+  indexing_model: "glm-5.2"
+  review_model: "glm-5.2"
+```
+
+```bash
+# .env
+ZAI_API_KEY=your-zai-api-key
+```
+
+Both endpoints use the same wire format, so the bundled `zai` provider profile
+covers either one: Mira controls thinking with `thinking.type` plus a top-level
+`reasoning_effort`, sends `tool_choice: "auto"`, and the dashboard offers the
+curated GLM model list. Keys are tied to their plan, so match the endpoint to
+your key — a Coding Plan key sent to the general endpoint fails with an
+insufficient-balance error.
+
 ### Codex CLI
 
 If you already use OpenAI Codex locally, Mira can run reviews through the
@@ -127,21 +159,60 @@ llm:
   codex_timeout_seconds: 900  # optional
 ```
 
-The official Mira image includes a pinned Codex CLI. Mount a Codex login read-only:
+The official Mira image includes a pinned Codex CLI. Log in to a directory that
+only Mira uses, then mount that directory writable so Mira can save refreshed
+tokens (see [Keeping the Codex login fresh](#keeping-the-codex-login-fresh)):
 
 ```bash
+CODEX_HOME="$(pwd)/codex-home" codex login
 docker run -p 8000:8000 --env-file .env \
   -e CODEX_HOME=/run/codex \
-  -v "$HOME/.codex:/run/codex:ro" \
+  -v "$(pwd)/codex-home:/run/codex" \
   -v "$(pwd)/mira.yaml:/app/mira.yaml:ro" \
   ghcr.io/miracodeai/mira:latest --config /app/mira.yaml
 ```
 
-This provider does not require `OPENROUTER_API_KEY`. Mira copies only `auth.json`
-from the read-only mount into a private, writable temporary Codex home for each
-invocation. It launches Codex in an empty temporary workspace with a minimal
-environment, disables inherited shell environment variables and user/project
-rules, and enforces the read-only sandbox.
+This provider does not require `OPENROUTER_API_KEY`.
+
+#### Isolation guarantees
+
+The review prompt contains untrusted pull-request content, so Mira assumes a
+prompt-injected model and gives it no way to act beyond writing its answer:
+
+- **No tools that read files, run commands, or reach the network.** Codex runs
+  with its shell and exec tools (`shell_tool`, `unified_exec`), image viewer
+  (`view_image`), sub-agents (`multi_agent`, `multi_agent_v2`), code mode, apps,
+  plugins, browser and computer use, image generation, and hooks disabled, and
+  with web search off. A model that calls one of these tools anyway gets
+  `unsupported call` back and nothing runs.
+- **Fail closed on Codex upgrades.** Tools are switched off with `--disable`,
+  which rejects unknown feature names. If a Codex release renames or drops one,
+  reviews fail with `Unknown feature flag` instead of running with the tool on.
+  Tested with Codex 0.154.0, the version pinned in the official image. Releases
+  before the `view_image` feature flag existed can't disable the image viewer
+  and refuse to start.
+- **No inherited configuration.** `$CODEX_HOME/config.toml`, user and project
+  `.rules` files, and shell environment inheritance are ignored. Mira copies
+  only `auth.json` from the mount into a private temporary Codex home, runs
+  Codex in an empty temporary workspace with an allow-listed environment (no
+  Mira, GitHub, or database credentials), and discards both afterwards
+  (`--ephemeral`). The only thing that flows back is a refreshed login, saved
+  to the mounted `auth.json` (see
+  [Keeping the Codex login fresh](#keeping-the-codex-login-fresh)).
+- **No writes.** The `read-only` sandbox stays on as a second layer.
+
+What these guarantees do **not** cover:
+
+- The read-only sandbox blocks writes, not reads. Mira's file-safety comes from
+  the model having no file or shell tool, not from the sandbox. Before tools
+  were disabled, a canary test with a working sandbox showed an injected model
+  could `cat` a planted `/run/secrets` key and echo it into the review.
+- The Codex process itself runs with the Mira container's user and can read
+  whatever that user can, including its own copy of `auth.json`. Run the
+  container as a non-root user and keep unrelated secrets out of it as defense
+  in depth.
+- The prompt, including pull-request content and Mira's instructions, is sent
+  to OpenAI, and the model can put any of it in its answer.
 Provider choice, executable/auth paths, sandbox policy, and timeout are
 deployment-only settings; repository `.mira.yaml` files cannot override them.
 For one-shot `mira review` runs, `--config` is treated as untrusted by default.
@@ -152,6 +223,80 @@ Codex CLI does not expose Mira's temperature or hard output-token controls, so
 Mira disables ensemble sampling for this provider. The mounted OAuth session is
 still a sensitive deployment credential: use a dedicated Codex account/session
 and isolate the Mira container from unrelated host files and services.
+
+#### Keeping the Codex login fresh
+
+A ChatGPT login in `auth.json` holds an access token and a single-use refresh
+token. Codex refreshes the login shortly before the access token expires
+(currently every 10 days) and writes the new tokens to its own `auth.json`,
+which for Mira is the temporary copy. Mira saves that refresh back to the
+mounted `auth.json`:
+
+- **As soon as it happens.** Mira checks the copy every second while Codex runs
+  and once more after Codex exits, including runs that fail, time out, or are
+  cancelled. Nothing else from the temporary Codex home is written back.
+- **Only if it is newer.** The copy is saved only when it changed, parses as a
+  login for the same account as the mounted file, and has a later
+  `last_refresh` than the mounted file. A login that another run saved later,
+  or a login for a different account, is never overwritten.
+- **Atomically, under a lock.** Mira holds an exclusive lock on
+  `.mira-auth.lock` while it compares and replaces `auth.json`: it writes a
+  temporary file with mode `0600` and renames it over the old one.
+- **One refresh at a time.** A run whose access token could expire before
+  `codex_timeout_seconds` elapse first takes `.mira-auth-refresh.lock`. Other
+  such runs wait (for at most that timeout) and then start from the refreshed
+  login instead of spending the same refresh token again. Runs with a fresh
+  token never wait.
+
+The mounted *directory* must be writable, because Mira replaces `auth.json` by
+renaming and creates its lock files next to it. A read-only mount, or a mount of
+the `auth.json` file alone, still works for an API-key login, but a ChatGPT
+login breaks at its first refresh: Mira logs `Codex refreshed its login but Mira
+could not save it`, and later runs fail with "refresh token was already used".
+To recover, run `CODEX_HOME=<mounted dir> codex login` again.
+
+Don't mount your personal `~/.codex`. The container could read and change your
+other Codex state, and your own Codex sessions don't take Mira's lock, so they
+can spend the same refresh token as Mira.
+
+### Claude CLI failover
+
+Mira can fail over from its primary provider to Claude through the Claude Code
+CLI, authenticated with a Claude subscription instead of an Anthropic API key.
+Create a long-lived token with `claude setup-token` and pass it to the container
+as `CLAUDE_CODE_OAUTH_TOKEN`:
+
+```yaml
+# mira.yaml
+llm:
+  base_url: "https://api.z.ai/api/paas/v4"   # primary provider, unchanged
+  api_key_env: "ZAI_API_KEY"
+  model: "glm-5.2"
+  failover_cooldown_seconds: 600    # skip the primary this long after a provider-side failure
+  failover_primary_max_retries: 1   # retry the primary less so failover happens quickly
+  failover:
+    provider: "claude-cli"
+    model: "sonnet"
+    max_context_tokens: 1000000
+    claude_oauth_token_env: "CLAUDE_CODE_OAUTH_TOKEN"   # optional; this is the default
+    claude_max_concurrency: 2                           # optional
+```
+
+A call that fails on the primary is re-sent to the failover provider. Rate
+limits, 5xx responses, timeouts, network errors, and auth errors also put the
+primary into a cooldown, so later calls go straight to the failover provider
+until it expires. Dashboard model overrides apply to the primary only; the
+failover provider uses the models in its own block. `provider: "claude-cli"`
+also works on its own, without failover.
+
+The official Mira image includes a pinned Claude Code CLI. Each call runs
+`claude -p` in an empty temporary directory with a minimal environment — only
+the subscription token is passed, never `ANTHROPIC_API_KEY` or Mira's service
+credentials — and with no tools, MCP servers, hooks, settings, slash commands,
+or saved session. Provider choice, the token variable, and all failover settings
+are deployment-only, as are `base_url` and `api_key_env`: repository
+`.mira.yaml` files cannot set them. Automated use draws on the subscription's
+usage limits; `claude_max_concurrency` caps how many CLI processes run at once.
 
 ## Configuration
 

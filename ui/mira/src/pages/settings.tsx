@@ -1,6 +1,7 @@
 import { Loader2 } from "lucide-react"
 import { useEffect, useState } from "react"
 
+import { FailoverStatusCard } from "@/components/failover-status-card"
 import { ModelCombobox, type ModelOption } from "@/components/model-combobox"
 import { Button } from "@/components/ui/button"
 import {
@@ -337,9 +338,11 @@ export function SettingsPage() {
               Choose models for indexing and PR reviews
               {backend &&
                 ` — listed from ${
-                  { openrouter: "OpenRouter", bedrock: "AWS Bedrock" }[
-                    backend
-                  ] ?? "your configured endpoint"
+                  {
+                    openrouter: "OpenRouter",
+                    zai: "Z.AI",
+                    bedrock: "AWS Bedrock",
+                  }[backend] ?? "your configured endpoint"
                 }`}
             </CardDescription>
           </CardHeader>
@@ -443,6 +446,8 @@ export function SettingsPage() {
           </CardContent>
         </Card>
       )}
+
+      {section === "models" && <FailoverStatusCard />}
 
       {section === "review" && (
         <Card>

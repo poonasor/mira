@@ -61,3 +61,19 @@ class TestCurrentGenerationModels:
             "anthropic/claude-opus-4-6",
         ):
             assert registry.get(model_id) is None
+
+
+class TestZAIGLM:
+    def test_glm_5_2_is_registered_with_verified_capabilities_and_pricing(self):
+        info = registry.get("glm-5.2")
+        assert info is not None
+        assert info["label"] == "GLM-5.2 (Z.AI)"
+        assert info["provider"] == "zai"
+        assert info["max_input_tokens"] == 1_000_000
+        assert info["max_output_tokens"] == 131_072
+        assert registry.pricing("glm-5.2") == (1.40, 4.40)
+        assert info["supports_json_mode"] is True
+        assert info["purposes"] == ["indexing", "review"]
+
+    def test_glm_5_3_is_not_registered(self):
+        assert registry.get("glm-5.3") is None
