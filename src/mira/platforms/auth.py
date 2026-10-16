@@ -16,7 +16,7 @@ from typing import Protocol, runtime_checkable
 class PlatformAuth(Protocol):
     """How a handler obtains a token and the bot's own identity."""
 
-    async def get_token(self, scope: str | int | None = None) -> str:
+    async def get_token(self, scope: str | int | None = None, *, force: bool = False) -> str:
         """Return an API token. ``scope`` is the installation id on GitHub,
         unused on token-based platforms."""
         ...

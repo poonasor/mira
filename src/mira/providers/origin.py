@@ -14,6 +14,7 @@ import asyncio
 import base64
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -119,17 +120,24 @@ def _patches_to_diff(files: list[dict[str, Any]]) -> str:
 class OriginProvider(BaseProvider):
     """Cursor Origin code hosting provider."""
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str | Callable[..., Awaitable[str]]) -> None:
+        """Accept a static bearer string or a token factory.
+
+        Origin installation tokens expire ~5 minutes after mint (capped by the
+        app JWT), so review runs longer than that must re-resolve the token per
+        request. Callers with app credentials pass
+        ``lambda force=False: auth.get_token(installation_id, force=force)``;
+        the factory's mint cache keeps that cheap. A static string (CLI
+        ``--origin-token`` / user access tokens) stays supported.
+        """
         if not token:
             raise ProviderError("Origin token is required")
-        # create_provider may pass a callable; BaseProvider typing says str,
-        # but GitHub accepts callables too. Normalize to str for Origin.
         if callable(token):
-            raise ProviderError(
-                "OriginProvider requires a resolved bearer token string "
-                "(call the token factory before create_provider)"
-            )
-        self._token = token
+            self._token_factory: Callable[..., Awaitable[str]] | None = token
+            self._token = ""
+        else:
+            self._token_factory = None
+            self._token = token
         profile = profiles.resolve("origin")
         self._api = (profile.get("api_url") or "https://api.cursor.com/v1/origin").rstrip("/")
         self._identity: str | None = None
@@ -162,15 +170,44 @@ class OriginProvider(BaseProvider):
     def _pr(self, pr_info: PRInfo) -> str:
         return f"{self._repo(pr_info.owner, pr_info.repo)}/pulls/{pr_info.number}"
 
-    def _headers(self, **extra: str) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}", **extra}
+    async def _resolve_token(self, force_refresh: bool = False) -> str:
+        """Current bearer token: the static string, or a fresh factory call.
+
+        The factory (when present) is invoked on every request — its underlying
+        mint cache makes this cheap and lets runs longer than the ~5-minute
+        token TTL keep working.
+        """
+        if self._token_factory is None:
+            return self._token
+        return await self._token_factory(force_refresh)
+
+    async def _headers(self, force_refresh: bool = False, **extra: str) -> dict[str, str]:
+        token = await self._resolve_token(force_refresh)
+        return {"Authorization": f"Bearer {token}", **extra}
 
     async def _request(
         self, method: str, url: str, *, ok: tuple[int, ...] = (200, 201), **kw: Any
     ) -> httpx.Response:
-        headers = self._headers(**kw.pop("headers", {}))
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.request(method, url, headers=headers, **kw)
+        extra_headers = kw.pop("headers", {})
+        resp: httpx.Response | None = None
+        for attempt in (0, 1):
+            # Second pass force-refreshes the token: a 401 means the cached
+            # token died early (clock skew / revocation), so re-mint and retry
+            # exactly once. Static-token sessions have nothing to re-mint.
+            headers = {
+                **await self._headers(force_refresh=bool(attempt)),
+                **extra_headers,
+            }
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.request(method, url, headers=headers, **kw)
+            if resp.status_code != 401 or self._token_factory is None:
+                break
+            logger.warning(
+                "Origin %s %s → 401; re-minting installation token and retrying once",
+                method,
+                url,
+            )
+        assert resp is not None  # the loop always executes at least once
         if resp.status_code not in ok:
             err = ProviderError(f"Origin {method} {url} → {resp.status_code}: {resp.text[:300]}")
             err.status_code = resp.status_code  # type: ignore[attr-defined]
@@ -181,22 +218,19 @@ class OriginProvider(BaseProvider):
         """Paginate an Origin collection that returns ``{list_key: [...], nextPageToken}``."""
         out: list[dict[str, Any]] = []
         page_token: str | None = None
-        async with httpx.AsyncClient(timeout=60) as client:
-            while True:
-                params: dict[str, Any] = {"pageSize": 100}
-                if page_token:
-                    params["pageToken"] = page_token
-                resp = await client.get(url, headers=self._headers(), params=params)
-                if resp.status_code != 200:
-                    raise ProviderError(
-                        f"Origin GET {url} → {resp.status_code}: {resp.text[:300]}"
-                    )
-                data = resp.json() or {}
-                items = data.get(list_key) or []
-                out.extend(items)
-                page_token = data.get("nextPageToken") or data.get("next_page_token") or None
-                if not page_token or not items:
-                    break
+        while True:
+            params: dict[str, Any] = {"pageSize": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            # Route through _request so every page re-resolves the token and a
+            # mid-pagination 401 still gets the re-mint retry.
+            resp = await self._request("GET", url, params=params, ok=(200,))
+            data = resp.json() or {}
+            items = data.get(list_key) or []
+            out.extend(items)
+            page_token = data.get("nextPageToken") or data.get("next_page_token") or None
+            if not page_token or not items:
+                break
         return out
 
     async def _self_identity(self) -> str:
@@ -322,7 +356,7 @@ class OriginProvider(BaseProvider):
                 try:
                     resp = await client.get(
                         base,
-                        headers=self._headers(),
+                        headers=await self._headers(),
                         params={
                             "path": path,
                             "sha": pr_info.head_sha or pr_info.head_branch,
