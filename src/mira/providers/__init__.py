@@ -22,8 +22,14 @@ def get_available_providers() -> list[str]:
     return sorted(_REGISTRY)
 
 
-def create_provider(name: str, token: str | Callable[[], Awaitable[str]]) -> BaseProvider:
-    """Instantiate a registered provider by name."""
+def create_provider(name: str, token: str | Callable[..., Awaitable[str]]) -> BaseProvider:
+    """Instantiate a registered provider by name.
+
+    ``token`` may be a static bearer string or an async factory — providers
+    that mint short-lived tokens (e.g. Origin, where installation tokens
+    expire after ~5 minutes) receive a factory taking a ``force_refresh``
+    bool so every request resolves a current token.
+    """
     with _LOCK:
         if name not in _REGISTRY:
             available = ", ".join(sorted(_REGISTRY)) or "(none)"

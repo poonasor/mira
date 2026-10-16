@@ -286,8 +286,10 @@ async def handle_origin_pr(
 
     try:
         _get_app_db().register_repo(owner, repo_name, platform="origin")
-        token = await auth.get_token(installation_id)
-        provider = create_provider("origin", token)
+        provider = create_provider(
+            "origin",
+            lambda force=False: auth.get_token(installation_id, force=force),
+        )
         # Labels aren't on the webhook snapshot — fetch when needed.
         await run_pr_review(
             provider,
@@ -350,7 +352,10 @@ async def handle_origin_push(
             changed: list[str] = []
             removed: list[str] = []
             if before and after and set(before) != {"0"} and set(after) != {"0"}:
-                provider = create_provider("origin", token)
+                provider = create_provider(
+                    "origin",
+                    lambda force=False: auth.get_token(installation_id, force=force),
+                )
                 # Reuse compare files via a synthetic PRInfo.
                 from mira.models import PRInfo
 
@@ -438,8 +443,10 @@ async def handle_origin_comment(
     thread_id = str(thread.get("id") or "")
 
     try:
-        token = await auth.get_token(installation_id)
-        provider = create_provider("origin", token)
+        provider = create_provider(
+            "origin",
+            lambda force=False: auth.get_token(installation_id, force=force),
+        )
         pr_info = await provider.get_pr_info(pr_url)
 
         names = mention_names(bot_name, await auth.get_bot_identity())

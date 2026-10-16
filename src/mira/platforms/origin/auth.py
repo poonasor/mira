@@ -24,8 +24,10 @@ from mira.platforms import profiles
 
 logger = logging.getLogger(__name__)
 
-# Origin installation tokens last at most 15 minutes (and never past the app
-# JWT that requested them). Refresh when less than 60s remain.
+# Origin installation tokens are capped by the requesting app JWT's lifetime:
+# Cursor returns expiresAt ≈ mint + 5 min (verified live 2026-10-16, NOT 15).
+# Reuse the cached token while >60s remain; `force=True` skips the cache so a
+# 401 from an early-revoked/clock-skewed token can re-mint immediately.
 _TOKEN_MIN_REMAINING = 60
 
 
@@ -93,11 +95,11 @@ class OriginAppAuth:
         self._identity_fetched = False
         self._identity: str | None = None
 
-    async def get_token(self, scope: str | int | None = None) -> str:
+    async def get_token(self, scope: str | int | None = None, *, force: bool = False) -> str:
         """PlatformAuth — mint a per-installation token. ``scope`` is the installation id."""
         if scope is None:
             raise WebhookError("Origin requires an installation id to mint a token")
-        return await self.get_installation_token(str(scope))
+        return await self.get_installation_token(str(scope), force=force)
 
     async def get_bot_identity(self) -> str | None:
         if not self._identity_fetched:
@@ -121,10 +123,14 @@ class OriginAppAuth:
         }
         return jwt.encode(payload, self._private_key, algorithm="EdDSA", headers=headers)
 
-    async def get_installation_token(self, installation_id: str) -> str:
-        """Mint (or reuse a cached) installation access token for ``installation_id``."""
+    async def get_installation_token(self, installation_id: str, *, force: bool = False) -> str:
+        """Mint (or reuse a cached) installation access token for ``installation_id``.
+
+        ``force=True`` skips the cache read — used when the API rejects a
+        cached token with 401 (clock skew / early revocation).
+        """
         cached = self._token_cache.get(installation_id)
-        if cached:
+        if cached and not force:
             token, expires_at = cached
             if expires_at - time.time() > _TOKEN_MIN_REMAINING:
                 return token

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Awaitable, Callable
 
 from mira.models import (
     BotThreadRecord,
@@ -18,7 +19,7 @@ class BaseProvider(abc.ABC):
     """Abstract base class for code hosting providers."""
 
     @abc.abstractmethod
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str | Callable[..., Awaitable[str]]) -> None:
         """Configure the API client with an auth token."""
 
     @abc.abstractmethod
