@@ -108,6 +108,8 @@ _WALKTHROUGH_LLM_RESPONSE = json.dumps(
 @pytest.fixture
 def mock_llm(sample_llm_response_text: str) -> LLMProvider:
     llm = MagicMock(spec=LLMProvider)
+    # No tool calls: the agentic loop exits and the forced review runs.
+    llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
     # Tool-calling methods used by engine
     llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
     llm.review = AsyncMock(return_value=sample_llm_response_text)
@@ -169,6 +171,8 @@ class TestReviewEngine:
         """A corrupted walkthrough LLM response (invalid JSON tool-call args)
         is retried up to 3 times instead of dropping the walkthrough."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         responses = [
             "NOT VALID JSON {{{",  # corrupted tool-call arguments
             '{"summary": "ok", "change_groups": []}',
@@ -197,6 +201,8 @@ class TestReviewEngine:
         """All 3 walkthrough attempts failing leaves walkthrough=None but the
         review itself still completes."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.walkthrough = AsyncMock(return_value="NOT VALID JSON {{{")
         llm.review = AsyncMock(
             return_value=json.dumps(
@@ -217,6 +223,8 @@ class TestReviewEngine:
     @pytest.mark.asyncio
     async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         no_comments = json.dumps(
             {
                 "comments": [],
@@ -260,6 +268,8 @@ class TestReviewEngine:
     async def test_noise_filtering_applied(self, sample_diff_text: str):
         """Verify that noise filtering reduces comments."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -344,6 +354,10 @@ class TestReviewEngine:
             return "NOT VALID JSON {{{"
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.walkthrough = AsyncMock(
             return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
@@ -449,6 +463,8 @@ class TestReviewEngine:
     async def test_walkthrough_disabled(self, sample_llm_response_text: str, sample_diff_text: str):
         """Walkthrough is skipped when disabled."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.review = AsyncMock(return_value=sample_llm_response_text)
         llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
         llm.complete = AsyncMock(return_value=sample_llm_response_text)
@@ -470,6 +486,8 @@ class TestReviewEngine:
     ):
         """Walkthrough failure does not block the review."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.walkthrough = AsyncMock(side_effect=RuntimeError("LLM exploded"))
         llm.review = AsyncMock(return_value=sample_llm_response_text)
         llm.complete = AsyncMock(return_value=sample_llm_response_text)
@@ -723,6 +741,8 @@ class TestReviewEngine:
             }
         )
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
         llm.review = AsyncMock(return_value=no_comments_response)
         llm.complete = AsyncMock(return_value=no_comments_response)
@@ -770,6 +790,10 @@ class TestReviewEngine:
         )
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
         llm.review = AsyncMock(return_value=chunk_response)
@@ -811,6 +835,8 @@ class TestReviewEngine:
         """When _review_diff_internal raises, the placeholder comment is updated
         with a failure message before the exception propagates."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -862,6 +888,8 @@ class TestReviewEngine:
         review failure must re-render it without the in-progress banner and
         append the failure notice — not wipe it, not leave it stuck."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -954,6 +982,10 @@ class TestDryRun:
         provider.find_bot_comment = AsyncMock(return_value=None)
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1069,6 +1101,10 @@ class TestThreadResolution:
         )
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1098,6 +1134,8 @@ class TestThreadResolution:
     ):
         """With auto_resolve_conversations off, no threads are fetched or resolved."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         llm.complete = AsyncMock(return_value=json.dumps({"results": []}))
@@ -1132,6 +1170,8 @@ class TestThreadResolution:
 
         verify_response = json.dumps({"results": []})
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1167,6 +1207,10 @@ class TestThreadResolution:
         )
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1760,6 +1804,10 @@ class TestSecurityReviewPass:
         from mira.core.passes import security_review_pass
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(return_value=canned)
 
         out = await security_review_pass(llm, files, files, "title")
@@ -1776,6 +1824,8 @@ class TestSecurityReviewPass:
 
         files = parse_diff(sample_diff_text).files
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(side_effect=RuntimeError("LLM down"))
 
         out = await security_review_pass(llm, files, files, "title")
@@ -1855,6 +1905,10 @@ class TestSecurityReviewPass:
         canned = json.dumps({"comments": [], "summary": "", "metadata": {"reviewed_files": 1}})
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(return_value=canned)
         llm.count_tokens = MagicMock(return_value=100)
 
@@ -1892,6 +1946,10 @@ index 1111111..2222222 100644
         from mira.core.passes import dependency_review_pass
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock()
 
         out = await dependency_review_pass(llm, [], ["react-table"], "title")
@@ -1924,6 +1982,8 @@ index 1111111..2222222 100644
             }
         )
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(return_value=canned)
 
         out = await dependency_review_pass(llm, files, ["react-table", "react"], "title")
@@ -1939,6 +1999,8 @@ index 1111111..2222222 100644
 
         files = parse_diff(self._MANIFEST_DIFF).files
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(side_effect=RuntimeError("LLM down"))
 
         out = await dependency_review_pass(llm, files, ["react-table"], "title")
@@ -2596,6 +2658,10 @@ class TestAgenticSecurityPass(TestAgenticToolsOnIndexedRepos):
         monkeypatch.setattr("mira.core.passes.agentic_review_loop", loop_mock)
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.complete_with_tools = AsyncMock(return_value=self._SECURITY_CANNED)
 
