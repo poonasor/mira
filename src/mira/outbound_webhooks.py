@@ -135,6 +135,10 @@ def _message(event: str, data: dict[str, Any]) -> tuple[str, str, str]:
         issues = data.get("key_issues", 0)
         title = f"✅ Mira reviewed {pr_ref}"
         body = f"*<{pr_url}|{pr_ref}>* — {comments} comment(s), {issues} key issue(s)"
+        failed = data.get("failed_chunks") or 0
+        if failed:
+            body += f" · ⚠️ {failed} chunk(s) couldn't be reviewed"
+            return title, body, "ECB22E"
         return title, body, "2EB67D"
 
     if event == REVIEW_HIGH_SEVERITY:
@@ -334,4 +338,6 @@ def sample_data(event: str) -> dict[str, Any]:
         "comments": 3,
         "key_issues": 1,
         "severities": {"blocker": 1, "warning": 2},
+        "failed_chunks": 0,
+        "failed_chunk_list": [],
     }

@@ -61,6 +61,7 @@ from mira.models import (
     UnresolvedThread,
     WalkthroughResult,
     build_review_stats,
+    failed_chunks_note,
 )
 from mira.providers.base import BaseProvider
 from mira.security.secrets_scan import scan_secrets
@@ -868,6 +869,8 @@ class ReviewEngine:
                         index_was_empty=getattr(self, "_index_was_empty", False),
                         dashboard_url=_os.environ.get("MIRA_DASHBOARD_URL", ""),
                         overlaps=overlaps or None,
+                        failed_chunks=result.failed_chunks or None,
+                        total_chunks=result.total_chunks,
                     )
                     comment_id = placeholder_id
                     if comment_id is None:
@@ -1341,6 +1344,9 @@ class ReviewEngine:
         base_existing = list(existing_comments) if existing_comments else []
         semaphore = _asyncio.Semaphore(self.config.review.max_concurrent_chunks)
         audit: list[dict] = []
+        # Chunks whose model output never parsed, even after one retry; made
+        # visible in the walkthrough, summary and review.completed payload.
+        failed_chunks: list[dict] = []
 
         async def _review_chunk(
             idx: int,
@@ -1373,7 +1379,15 @@ class ReviewEngine:
                     )
 
                     def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
-                        parsed = parse_llm_response(raw)
+                        parsed = parse_llm_response(raw, known_paths=[f.path for f in chunk.files])
+                        if parsed.dropped_comments:
+                            audit.append(
+                                {
+                                    "stage": "malformed_findings",
+                                    "chunk": idx,
+                                    "dropped": parsed.dropped_comments,
+                                }
+                            )
                         return (
                             convert_to_review_comments(
                                 parsed,
@@ -1404,7 +1418,31 @@ class ReviewEngine:
                         audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})
                     if not raw_response:
                         raw_response = await self.llm.review(messages)
-                    comments, key_issues, summary_text = _parse(raw_response)
+                    try:
+                        comments, key_issues, summary_text = _parse(raw_response)
+                    except ResponseParseError as exc:
+                        # Retry once, on another model when tiers are
+                        # configured, as a plain one-shot review (the same
+                        # fallback an empty agentic result gets).
+                        logger.warning(
+                            "Chunk %d/%d response failed to parse (%s); retrying once",
+                            idx + 1,
+                            len(chunks),
+                            exc,
+                        )
+                        audit.append(
+                            {"stage": "parse_retry", "chunk": idx, "error": str(exc)[:300]}
+                        )
+                        try:
+                            if hasattr(type(self.llm), "review_on_another_tier"):
+                                raw_response = await self.llm.review_on_another_tier(messages)  # type: ignore[attr-defined]
+                            else:
+                                raw_response = await self.llm.review(messages)
+                        except Exception as retry_exc:
+                            raise ResponseParseError(
+                                f"{exc}; retry failed: {retry_exc}"
+                            ) from retry_exc
+                        comments, key_issues, summary_text = _parse(raw_response)
 
                     # Ensemble: fire the extra runs in parallel and keep
                     # majority-vote findings. The agentic loop (if any) only
@@ -1459,11 +1497,19 @@ class ReviewEngine:
 
                     return comments, key_issues, summary_text
                 except ResponseParseError as exc:
-                    logger.warning(
-                        "Chunk %d/%d failed to parse, skipping: %s",
+                    logger.error(
+                        "Chunk %d/%d could not be reviewed (%d files): %s",
                         idx + 1,
                         len(chunks),
+                        len(chunk.files),
                         exc,
+                    )
+                    failed_chunks.append(
+                        {
+                            "chunk": idx + 1,
+                            "files": [f.path for f in chunk.files],
+                            "error": str(exc)[:300],
+                        }
                     )
                     return [], [], ""
 
@@ -1648,6 +1694,9 @@ class ReviewEngine:
             summary = cap_review_summary(summary)
         else:
             summary = ""
+        failed_chunks.sort(key=lambda c: c["chunk"])
+        if failed_chunks and summary:
+            summary = f"{failed_chunks_note(failed_chunks, len(chunks))}\n\n{summary}"
 
         walkthrough = await walkthrough_task
 
@@ -1685,4 +1734,6 @@ class ReviewEngine:
             skipped_paths=skipped_paths_only,
             total_paths=all_paths,
             audit=audit,
+            failed_chunks=failed_chunks,
+            total_chunks=len(chunks),
         )

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextvars import ContextVar
 
 import httpx
 
@@ -90,6 +91,12 @@ def _prompt_text(messages: list) -> str:
     return "\n".join(str(m.get("content") or "") for m in messages if isinstance(m, dict))
 
 
+# Index of the tier that served the current task's latest call, so a caller
+# can retry a bad answer on a different tier (per task: chunks run
+# concurrently).
+_served_tier: ContextVar[int | None] = ContextVar("mira_served_tier", default=None)
+
+
 class TieredProvider:
     """An LLM provider whose calls fail over across an ordered list of providers."""
 
@@ -143,12 +150,19 @@ class TieredProvider:
         return ready or indexed
 
     async def _dispatch(
-        self, method: str, messages: list, *args: object, agentic: bool = False, **kwargs: object
+        self,
+        method: str,
+        messages: list,
+        *args: object,
+        agentic: bool = False,
+        skip: frozenset[int] = frozenset(),
+        **kwargs: object,
     ) -> object:
         prompt = _prompt_text(messages)
         errors: list[str] = []
         last_exc: Exception | None = None
-        for index, cfg, provider in self._candidates():
+        candidates = [c for c in self._candidates() if c[0] not in skip] or self._candidates()
+        for index, cfg, provider in candidates:
             name = f"tier {index + 1} ({cfg.provider}:{cfg.model})"
             if agentic and not getattr(provider, "supports_tool_calling", False):
                 logger.warning("Skipping %s for agentic call: no tool-calling support", name)
@@ -185,6 +199,7 @@ class TieredProvider:
             finally:
                 self._sync_usage()
             self.last_tier = name
+            _served_tier.set(index)
             logger.info("LLM %s served by %s", method, name)
             return result
 
@@ -244,6 +259,20 @@ class TieredProvider:
 
     async def review(self, messages: list[dict[str, str]], temperature: float | None = None) -> str:
         return str(await self._dispatch("review", messages, temperature=temperature))
+
+    async def review_on_another_tier(
+        self, messages: list[dict[str, str]], temperature: float | None = None
+    ) -> str:
+        """Review again, preferring a tier other than the one that served this
+        task's last call (e.g. after its answer failed to parse)."""
+        served = _served_tier.get()
+        skip = frozenset({served}) if served is not None and len(self.tiers) > 1 else frozenset()
+        if skip:
+            cfg = self.tiers[served][0]  # type: ignore[index]
+            logger.info(
+                "Retrying review without tier %d (%s:%s)", served + 1, cfg.provider, cfg.model
+            )
+        return str(await self._dispatch("review", messages, temperature=temperature, skip=skip))
 
     async def walkthrough(self, messages: list[dict[str, str]]) -> str:
         return str(await self._dispatch("walkthrough", messages))

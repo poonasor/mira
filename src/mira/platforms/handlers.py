@@ -75,6 +75,26 @@ def _help_message(bot_name: str) -> str:
     )
 
 
+def review_completed_payload(repo_full: str, pr_url: str, number: int, result: Any) -> dict:
+    """The ``review.completed`` webhook payload for a finished review."""
+    from mira.models import build_review_stats
+
+    stats = build_review_stats(result.comments)
+    failed = list(getattr(result, "failed_chunks", None) or [])
+    return {
+        "repo": repo_full,
+        "pr_url": pr_url,
+        "number": number,
+        "comments": len(result.comments),
+        "key_issues": len(result.key_issues),
+        "severities": {sev.name.lower(): n for sev, n in stats.items()},
+        # Chunks that couldn't be reviewed (model output never parsed), so a
+        # 0-comment review isn't mistaken for a clean one.
+        "failed_chunks": len(failed),
+        "failed_chunk_list": failed,
+    }
+
+
 async def run_pr_review(
     provider: Any,
     owner: str,
@@ -149,14 +169,7 @@ async def run_pr_review(
     )
 
     stats = build_review_stats(result.comments)
-    event_data = {
-        "repo": repo_full,
-        "pr_url": pr_url,
-        "number": number,
-        "comments": len(result.comments),
-        "key_issues": len(result.key_issues),
-        "severities": {sev.name.lower(): n for sev, n in stats.items()},
-    }
+    event_data = review_completed_payload(repo_full, pr_url, number, result)
     await dispatch_event(REVIEW_COMPLETED, event_data)
     if any(sev >= Severity.WARNING for sev in stats):
         await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)

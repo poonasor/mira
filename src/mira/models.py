@@ -214,6 +214,8 @@ class WalkthroughResult:
         dashboard_url: str = "",
         overlaps: list[OverlapFinding] | None = None,
         failure_notice: str | None = None,
+        failed_chunks: list[dict] | None = None,
+        total_chunks: int = 0,
     ) -> str:
         """Render as a markdown PR comment."""
         parts = [WALKTHROUGH_MARKER, "## Mira PR Walkthrough", ""]
@@ -319,6 +321,12 @@ class WalkthroughResult:
                 parts.append("")
                 parts.append(f"*{separator.join(stats_parts)}*")
 
+        if failed_chunks and not in_progress:
+            parts.append("")
+            parts.append("---")
+            parts.append("")
+            parts.append(f"> {failed_chunks_note(failed_chunks, total_chunks)}")
+
         if skipped_paths and not in_progress:
             total = len(total_paths) if total_paths else (reviewed_files + len(skipped_paths))
             shown = min(8, len(skipped_paths))
@@ -405,6 +413,24 @@ class ReviewResult:
     # filter/critique stage, so a benchmark run can show whether a missed
     # finding was never drafted or drafted-then-dropped. Not posted anywhere.
     audit: list[dict] = field(default_factory=list)
+    # Chunks whose model output never parsed, even after a retry:
+    # [{"chunk": 1-based index, "files": [...], "error": "..."}].
+    failed_chunks: list[dict] = field(default_factory=list)
+    total_chunks: int = 0
+
+
+def failed_chunks_note(failed_chunks: list[dict], total_chunks: int) -> str:
+    """One line saying which chunks couldn't be reviewed, for summaries."""
+    files = [f for chunk in failed_chunks for f in chunk.get("files", [])]
+    shown = ", ".join(f"`{f}`" for f in files[:6])
+    more = f" and {len(files) - 6} more" if len(files) > 6 else ""
+    total = max(total_chunks, len(failed_chunks))
+    noun = "chunk" if total == 1 else "chunks"
+    return (
+        f"⚠️ {len(failed_chunks)} of {total} review {noun} couldn't be reviewed "
+        "(the model's answer didn't parse, even after a retry), so findings may be "
+        f"missing for: {shown}{more}."
+    )
 
 
 @dataclass

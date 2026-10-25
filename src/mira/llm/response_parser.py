@@ -55,6 +55,8 @@ class LLMReviewResponse(BaseModel):
     key_issues: list[LLMKeyIssue] = Field(default_factory=list)
     summary: str = ""
     metadata: LLMMetadata = Field(default_factory=LLMMetadata)
+    # Findings dropped because they failed validation (see _salvage_items).
+    dropped_comments: int = Field(default=0, exclude=True)
 
 
 # Anthropic-style tool-call XML delimiters some models leak into the JSON
@@ -141,8 +143,72 @@ def validate_tool_arguments(raw: str, *, provider: str, model: str) -> str:
     return raw
 
 
-def parse_llm_response(raw_text: str) -> LLMReviewResponse:
-    """Parse raw LLM text output into a validated LLMReviewResponse."""
+_PATH_TEXT_FIELDS = ("agent_prompt", "title", "body", "suggestion")
+
+
+def _path_from_text(item: dict, known_paths: list[str]) -> str | None:
+    """The one known file path a finding's prose names, if exactly one."""
+    text = " ".join(str(item.get(key) or "") for key in _PATH_TEXT_FIELDS)
+    hits = {
+        path
+        for path in known_paths
+        if path and re.search(rf"(?<![\w./-]){re.escape(path)}(?![\w/-])", text)
+    }
+    # A path that is a suffix of another hit (src/a.py vs pkg/src/a.py) is the
+    # same mention; keep the longest.
+    hits = {h for h in hits if not any(o != h and o.endswith("/" + h) for o in hits)}
+    return hits.pop() if len(hits) == 1 else None
+
+
+def _salvage_items(data: dict, known_paths: list[str] | None) -> int:
+    """Repair or drop individual malformed findings so one bad item can't
+    sink the whole chunk. Returns how many comments were dropped."""
+    dropped = 0
+    comments = data.get("comments")
+    if isinstance(comments, list):
+        kept: list = []
+        for item in comments:
+            if (
+                isinstance(item, dict)
+                and known_paths
+                and not (isinstance(item.get("path"), str) and item["path"].strip())
+            ):
+                recovered = _path_from_text(item, known_paths)
+                if recovered:
+                    logger.info("Recovered missing path %r from finding text", recovered)
+                    item = {**item, "path": recovered}
+            try:
+                LLMComment.model_validate(item)
+            except ValidationError as exc:
+                dropped += 1
+                logger.warning(
+                    "Dropping one malformed finding: %s",
+                    "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors()),
+                )
+                continue
+            kept.append(item)
+        data["comments"] = kept
+    key_issues = data.get("key_issues")
+    if isinstance(key_issues, list):
+        good = []
+        for item in key_issues:
+            try:
+                LLMKeyIssue.model_validate(item)
+            except ValidationError:
+                logger.warning("Dropping one malformed key issue")
+                continue
+            good.append(item)
+        data["key_issues"] = good
+    return dropped
+
+
+def parse_llm_response(raw_text: str, known_paths: list[str] | None = None) -> LLMReviewResponse:
+    """Parse raw LLM text output into a validated LLMReviewResponse.
+
+    Findings that fail validation are dropped individually (after trying to
+    recover a missing ``path`` from the finding's text against
+    ``known_paths``) instead of failing the whole response.
+    """
     cleaned = strip_think_blocks(raw_text)
     cleaned = strip_code_fences(cleaned)
 
@@ -157,11 +223,14 @@ def parse_llm_response(raw_text: str) -> LLMReviewResponse:
         raise ResponseParseError(f"Expected JSON object, got {type(data).__name__}")
 
     data = _unstring_nested_json(data)
+    dropped = _salvage_items(data, known_paths)
 
     try:
-        return LLMReviewResponse.model_validate(data)
+        response = LLMReviewResponse.model_validate(data)
     except Exception as e:
         raise ResponseParseError(f"LLM response validation failed: {e}") from e
+    response.dropped_comments = dropped
+    return response
 
 
 def _build_diff_line_ranges(files: list[FileDiff]) -> dict[str, list[tuple[int, int]]]:
