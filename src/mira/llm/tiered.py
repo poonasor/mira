@@ -232,6 +232,16 @@ class TieredProvider:
         )
         return result if isinstance(result, dict) else {"content": "", "tool_calls": []}
 
+    async def close_agentic(self, messages: list) -> None:
+        """Free any CLI session a tier kept open for this agentic loop."""
+        for _, provider in self.tiers:
+            close = getattr(provider, "close_agentic", None)
+            if callable(close):
+                try:
+                    await close(messages)
+                except Exception:  # noqa: BLE001 - cleanup must not fail a review
+                    logger.debug("close_agentic failed on %s", type(provider).__name__)
+
     async def review(self, messages: list[dict[str, str]], temperature: float | None = None) -> str:
         return str(await self._dispatch("review", messages, temperature=temperature))
 

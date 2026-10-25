@@ -3,9 +3,13 @@
 The OAuth token comes from ``claude setup-token`` and reaches the child process
 only as ``CLAUDE_CODE_OAUTH_TOKEN``; no Anthropic API key is read or sent. The
 prompt carries untrusted pull-request content, so the CLI runs with no tools,
-settings, hooks, MCP servers, slash commands, or saved session, in an empty
-working directory. Agentic review hops still work: the model names the
-read_file/grep_repo calls it wants as JSON and Mira runs them (see cli_base).
+settings, hooks, MCP servers or slash commands, in an empty working directory.
+Agentic review hops still work: the model names the read_file/grep_repo calls
+it wants as JSON and Mira runs them (see cli_base). One agentic loop is one CLI
+session (``--session-id`` then ``--resume``) kept in a private temporary
+directory that is deleted when the loop ends, so later hops send only the new
+tool results and the API serves the earlier turns from its prompt cache.
+Every other call runs with ``--no-session-persistence``.
 """
 
 from __future__ import annotations
@@ -14,11 +18,17 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import tempfile
+import uuid
 import weakref
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
+from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm.cli_base import CLIProviderBase
 
@@ -29,6 +39,12 @@ PROVIDER_NAMES = frozenset({"claude-cli", "claude_cli", "claude"})
 # The CLI retries API errors itself (10 times by default); keep that short so a
 # rate-limited subscription hands off to the next tier quickly.
 _CLI_MAX_RETRIES = 2
+
+# Oldest Claude Code release that knows claude-sonnet-5-5 (Mira's default
+# claude-cli model). The image installs the newest release on every build;
+# this only drives the startup warning.
+MIN_CLI_VERSION = (2, 1, 284)
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 _gates: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
     weakref.WeakKeyDictionary()
@@ -43,6 +59,18 @@ def _concurrency_gate(limit: int) -> asyncio.Semaphore:
     return gate
 
 
+@dataclass
+class _Session:
+    """A resumable CLI session: its id and the private dirs it lives in."""
+
+    session_id: str
+    tmp: tempfile.TemporaryDirectory
+
+    @property
+    def root(self) -> Path:
+        return Path(self.tmp.name)
+
+
 class ClaudeCLIProvider(CLIProviderBase):
     """LLM provider that shells out to Anthropic's Claude Code CLI."""
 
@@ -52,6 +80,20 @@ class ClaudeCLIProvider(CLIProviderBase):
     # Agentic hops are emulated over text (see cli_base), so the CLI itself
     # still runs with `--tools ""` while Mira executes read_file/grep_repo.
     supports_tool_calling = True
+    supports_session_resume = True
+
+    def _new_session(self) -> _Session:
+        session = _Session(
+            session_id=str(uuid.uuid4()),
+            tmp=tempfile.TemporaryDirectory(prefix="mira-claude-session-"),
+        )
+        for name in ("home", "config", "work"):
+            (session.root / name).mkdir(mode=0o700)
+        return session
+
+    def _close_session(self, session: object) -> None:
+        if isinstance(session, _Session):
+            session.tmp.cleanup()
 
     def _token(self) -> str:
         token_env = self.config.claude_oauth_token_env
@@ -79,7 +121,7 @@ class ClaudeCLIProvider(CLIProviderBase):
         )
         return env
 
-    def _command(self) -> list[str]:
+    def _command(self, session_args: list[str] | None = None) -> list[str]:
         command = self.config.claude_command or "claude"
         if any(char in command for char in (" ", "\t", "\n", ";", "|", "&")):
             raise ValueError(
@@ -103,19 +145,27 @@ class ClaudeCLIProvider(CLIProviderBase):
             "--settings",
             '{"disableAllHooks":true}',
             "--disable-slash-commands",
-            "--no-session-persistence",
+            *(session_args if session_args is not None else ["--no-session-persistence"]),
         ]
 
-    async def _run(self, prompt: str) -> str:
+    async def _run(self, prompt: str, session: _Session | None = None, resume: bool = False) -> str:
         async with _concurrency_gate(self.config.claude_max_concurrency):
-            with tempfile.TemporaryDirectory(prefix="mira-claude-") as tmpdir:
+            with (
+                tempfile.TemporaryDirectory(prefix="mira-claude-")
+                if session is None
+                else _keep(session.tmp.name)
+            ) as tmpdir:
                 runtime_home, config_dir, workdir = (
                     Path(tmpdir) / name for name in ("home", "config", "work")
                 )
-                for directory in (runtime_home, config_dir, workdir):
-                    directory.mkdir(mode=0o700)
+                if session is None:
+                    for directory in (runtime_home, config_dir, workdir):
+                        directory.mkdir(mode=0o700)
+                    cmd = self._command()
+                else:
+                    flag = "--resume" if resume else "--session-id"
+                    cmd = self._command([flag, session.session_id])
                 env = self._env(str(runtime_home), str(config_dir))
-                cmd = self._command()
                 logger.debug("Running Claude CLI provider: %s", shlex.join(cmd))
                 try:
                     proc = await asyncio.create_subprocess_exec(
@@ -195,3 +245,69 @@ class ClaudeCLIProvider(CLIProviderBase):
             return
         self.total_prompt_tokens += self.count_tokens(prompt)
         self.total_completion_tokens += self.count_tokens(result)
+
+
+@contextmanager
+def _keep(path: str) -> Iterator[str]:
+    """Yield an existing session directory without deleting it afterwards."""
+    yield path
+
+
+def claude_cli_configs(config: LLMConfig) -> list[LLMConfig]:
+    """The configured tiers (primary, then failover) that use the Claude CLI."""
+    tiers = [config, *([config.failover] if config.failover else [])]
+    return [tier for tier in tiers if tier.provider.lower() in PROVIDER_NAMES]
+
+
+def parse_cli_version(text: str) -> tuple[int, int, int] | None:
+    match = _VERSION_RE.search(text)
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
+
+async def log_claude_cli_version(config: LLMConfig, timeout: float = 15.0) -> str | None:
+    """Log the installed ``claude --version`` once; warn when it is too old.
+
+    Never raises: a missing or broken CLI is reported here and again, as a
+    normal provider failure, on the first call.
+    """
+    tiers = claude_cli_configs(config)
+    if not tiers:
+        return None
+    command = tiers[0].claude_command or "claude"
+    try:
+        with tempfile.TemporaryDirectory(prefix="mira-claude-version-") as home:
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
+            env.update({"HOME": home, "CLAUDE_CONFIG_DIR": home, "DISABLE_AUTOUPDATER": "1"})
+            proc = await asyncio.create_subprocess_exec(
+                command,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=home,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise
+    except Exception as exc:
+        logger.warning("Claude Code CLI version check failed for %r: %s", command, exc)
+        return None
+    text = stdout.decode("utf-8", errors="replace").strip()
+    version = parse_cli_version(text)
+    if version is None:
+        logger.warning("Claude Code CLI %r printed no version: %r", command, text[:200])
+        return None
+    shown = ".".join(map(str, version))
+    if version < MIN_CLI_VERSION:
+        logger.warning(
+            "Claude Code CLI %s is older than %s, which claude-sonnet-5-5 needs; "
+            "rebuild the image to install the latest CLI",
+            shown,
+            ".".join(map(str, MIN_CLI_VERSION)),
+        )
+    else:
+        logger.info("Claude Code CLI %s (models: %s)", shown, ", ".join(t.model for t in tiers))
+    return shown

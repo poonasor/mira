@@ -268,6 +268,15 @@ class ReviewConfig(BaseModel):
     # index context. Disable to force single-shot reviews (cheaper, less
     # thorough).
     agentic_tools: bool = True
+    # Token caps for that loop, per chunk. `agentic_max_hops` counts model
+    # calls including the final submit_review (the model is told to submit
+    # before the last one); file reads are cut at `agentic_max_file_chars`
+    # (the model can ask for a line range), and all tool output in a chunk
+    # shares `agentic_max_total_chars`.
+    agentic_max_hops: int = Field(default=6, ge=1, le=20)
+    agentic_max_file_chars: int = Field(default=12_000, ge=1_000, le=200_000)
+    agentic_max_total_chars: int = Field(default=50_000, ge=1_000, le=500_000)
+    agentic_max_grep_hits: int = Field(default=30, ge=1, le=200)
 
     # Whether the JIT cross-file resolver should attempt Java + Go imports.
     # Resolution for those languages is heuristic (we can't see the build

@@ -57,12 +57,14 @@ async def agentic_review_loop(
     """Run an agentic tool-use loop until the LLM submits a review.
 
     Hands the model `read_file` and `grep_repo` alongside the terminal
-    `submit_review` tool. Caps at 6 hops to bound token spend; returns the
-    JSON args of the final `submit_review` call (same shape `llm.review`
-    returns), or "" if the loop exited without one — caller falls back to
-    a forced single-tool call.
+    `submit_review` tool. Caps model calls at the executor's `max_hops`
+    (default 6) to bound token spend, and tells the model before the last
+    one that it must submit, so the caller rarely has to re-send the whole
+    prompt for a forced review. Returns the JSON args of the final
+    `submit_review` call (same shape `llm.review` returns), or "" if the
+    loop exited without one — caller falls back to a forced single-tool call.
     """
-    from mira.llm.agentic_tools import AGENTIC_TOOLS
+    from mira.llm.agentic_tools import AGENTIC_TOOLS, DEFAULT_MAX_HOPS
 
     tools = [*AGENTIC_TOOLS, SUBMIT_REVIEW_TOOL]
     convo: list[dict] = [dict(m) for m in messages]
@@ -70,66 +72,89 @@ async def agentic_review_loop(
         convo[0]["content"] = (
             convo[0]["content"] + "\n\n## Tools\n\n"
             "You have two helpers for "
-            "cross-file checks: `read_file(path)` and "
+            "cross-file checks: `read_file(path, start_line?, end_line?)` and "
             "`grep_repo(pattern, path_glob?, path_only?)`. Use them when, "
             "and ONLY when, you need to verify a cross-file claim before "
             "filing a comment (e.g. *does the called function actually "
             "raise X?*, *is this symbol defined elsewhere?*). Don't browse — "
-            "fetch what you specifically need. Skip the tools entirely if "
+            "fetch what you specifically need, and batch independent calls "
+            "into one turn. Skip the tools entirely if "
             "the diff alone is enough. Once you're ready, call "
             "`submit_review` with all your findings."
         )
 
-    max_hops = 6
-    for hop in range(max_hops):
-        try:
-            msg = await llm.complete_agentic(convo, tools=tools)
-        except Exception as exc:
-            logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
-            return ""
-
-        tool_calls = msg.get("tool_calls") or []
-        content = msg.get("content") or ""
-
-        if not tool_calls:
-            logger.debug(
-                "Agentic loop exited at hop %d without submit_review (content=%d chars)",
-                hop + 1,
-                len(content),
-            )
-            return ""
-
-        convo.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            }
-        )
-
-        for call in tool_calls:
-            fn = call.get("function") or {}
-            name = fn.get("name") or ""
-            if name == "submit_review":
-                return fn.get("arguments") or ""
-
-            raw_args = fn.get("arguments") or "{}"
+    hops = getattr(executor, "max_hops", None)
+    max_hops = hops if isinstance(hops, int) and hops > 0 else DEFAULT_MAX_HOPS
+    try:
+        for hop in range(max_hops):
             try:
-                args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except Exception:
-                args = {}
+                msg = await llm.complete_agentic(convo, tools=tools)
+            except Exception as exc:
+                logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
+                return ""
 
-            tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
+            tool_calls = msg.get("tool_calls") or []
+            content = msg.get("content") or ""
+
+            if not tool_calls:
+                logger.debug(
+                    "Agentic loop exited at hop %d without submit_review (content=%d chars)",
+                    hop + 1,
+                    len(content),
+                )
+                return ""
+
             convo.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": call.get("id") or "",
-                    "content": tool_result,
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
                 }
             )
 
+            for call in tool_calls:
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                if name == "submit_review":
+                    return fn.get("arguments") or ""
+
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args = {}
+
+                tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
+                convo.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or "",
+                        "content": tool_result,
+                    }
+                )
+
+            # Next call is the last one: say so in the tool result (a trailing
+            # user turn would break providers that require strict alternation)
+            # so the model submits instead of asking for more and forcing the
+            # caller to re-send the whole prompt for a one-shot review.
+            if hop + 2 == max_hops and convo[-1].get("role") == "tool":
+                convo[-1]["content"] = str(convo[-1].get("content") or "") + _LAST_HOP_NOTE
+    finally:
+        close = getattr(llm, "close_agentic", None)
+        if callable(close):
+            try:
+                await close(convo)
+            except Exception as exc:
+                logger.debug("Closing agentic session failed: %s", exc)
+
     logger.debug("Agentic loop hit %d-hop cap without submit_review", max_hops)
     return ""
+
+
+_LAST_HOP_NOTE = (
+    "\n\n[Mira: tool budget reached. Your next reply must call submit_review "
+    "with your findings; further tool calls will not run.]"
+)
 
 
 def _indexing_llm(fallback: LLMProviderProtocol) -> LLMProviderProtocol:

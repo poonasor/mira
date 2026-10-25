@@ -39,6 +39,16 @@ def _json_status(status: str) -> Response:
     )
 
 
+async def _log_claude_cli_version() -> None:
+    try:
+        from mira.config import load_config
+        from mira.llm.claude_cli import log_claude_cli_version
+
+        await log_claude_cli_version(load_config().llm)
+    except Exception as exc:
+        logger.warning("Claude Code CLI version check skipped: %s", exc)
+
+
 def create_app(
     app_auth: GitHubAppAuth | None = None,
     webhook_secret: str | None = None,
@@ -114,7 +124,13 @@ def create_app(
             )
         )
 
+        # Log the bundled Claude Code CLI version when a claude-cli tier is
+        # configured; fire-and-forget so a slow CLI never delays startup.
+        cli_version_task = asyncio.create_task(_log_claude_cli_version())
+
         yield
+        if not cli_version_task.done():
+            cli_version_task.cancel()
         if backfill_task is not None and not backfill_task.done():
             backfill_task.cancel()
         if forgejo_auth is not None and not fj_task.done():

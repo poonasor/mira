@@ -365,7 +365,7 @@ class TestProtocol:
         prompt = llm._run.await_args.args[0]
         assert "tool result for call call_1" in prompt
         assert "1: def f(): pass" in prompt
-        assert '"name": "read_file"' in prompt
+        assert '"name":"read_file"' in prompt
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -418,3 +418,200 @@ class TestProtocol:
             provider()._extract_json_object("[1, 2]")
 
         assert info.value.code == "claude_non_object_json"
+
+
+def _hop_loop_provider(replies: list[str]) -> tuple[ClaudeCLIProvider, list[dict]]:
+    """A provider whose _run records (prompt, session, resume) per call."""
+    llm = provider(model="claude-sonnet-5-5")
+    calls: list[dict] = []
+    queue = list(replies)
+
+    async def fake_run(prompt: str, session=None, resume: bool = False) -> str:
+        calls.append({"prompt": prompt, "session": session, "resume": resume})
+        return queue.pop(0)
+
+    llm._run = fake_run  # type: ignore[method-assign]
+    return llm, calls
+
+
+def _read(path: str) -> str:
+    return json.dumps({"tool_calls": [{"name": "read_file", "arguments": {"path": path}}]})
+
+
+class TestAgenticSessionResume:
+    def test_session_flags_replace_no_session_persistence(self):
+        llm = provider()
+        assert llm._command()[-1] == "--no-session-persistence"
+        first = llm._command(["--session-id", "abc"])
+        later = llm._command(["--resume", "abc"])
+        assert "--no-session-persistence" not in first + later
+        assert first[-2:] == ["--session-id", "abc"]
+        assert later[-2:] == ["--resume", "abc"]
+        # Everything else (sandboxing flags) is identical to the stateless call.
+        assert first[:-2] == llm._command()[:-1]
+
+    @pytest.mark.asyncio
+    async def test_later_hops_resume_and_send_only_new_tool_results(self):
+        from mira.core.passes import agentic_review_loop
+
+        review = {"comments": [], "summary": "ok"}
+        llm, calls = _hop_loop_provider(
+            [
+                _read("a.py"),
+                _read("b.py"),
+                json.dumps({"tool_calls": [{"name": "submit_review", "arguments": review}]}),
+            ]
+        )
+        executor = MagicMock()
+        executor.max_hops = 6
+        executor.execute = AsyncMock(side_effect=["A-CONTENT", "B-CONTENT"])
+        system = "SYSTEM-PROMPT " * 200
+        diff = "DIFF-LINE\n" * 500
+
+        raw = await agentic_review_loop(
+            llm,
+            [{"role": "system", "content": system}, {"role": "user", "content": diff}],
+            executor,
+        )
+
+        assert json.loads(raw) == review
+        assert [c["resume"] for c in calls] == [False, True, True]
+        session = calls[0]["session"]
+        assert session is not None and all(c["session"] is session for c in calls)
+        first, second, third = (c["prompt"] for c in calls)
+        assert "SYSTEM-PROMPT" in first and "DIFF-LINE" in first and '"read_file"' in first
+        for later in (second, third):
+            assert "SYSTEM-PROMPT" not in later
+            assert "DIFF-LINE" not in later
+            assert '"description"' not in later  # tool schemas aren't re-sent
+            assert '{"tool_calls"' in later  # but the output contract is
+        assert "A-CONTENT" in second and "B-CONTENT" not in second
+        assert "B-CONTENT" in third and "A-CONTENT" not in third
+        assert 'read_file {"path": "b.py"}' in third
+        # The loop closed the session: its private directory is gone.
+        assert not session.root.exists()
+        assert llm._threads == {}
+
+    @pytest.mark.asyncio
+    async def test_foreign_assistant_reply_starts_a_fresh_session(self):
+        llm, calls = _hop_loop_provider([_read("a.py"), _read("b.py")])
+        convo: list[dict] = [{"role": "user", "content": "DIFF"}]
+        tools = list(AGENTIC_TOOLS)
+
+        await llm.complete_agentic(convo, tools=tools)
+        old_session = calls[0]["session"]
+        # Another tier answered this hop, so the session never saw this reply.
+        convo += [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "other", "function": {}}]},
+            {"role": "tool", "tool_call_id": "other", "content": "R"},
+        ]
+        await llm.complete_agentic(convo, tools=tools)
+
+        assert calls[1]["resume"] is False
+        assert calls[1]["session"] is not old_session
+        assert "DIFF" in calls[1]["prompt"]
+        assert not old_session.root.exists()
+        await llm.close_agentic(convo)
+        assert not calls[1]["session"].root.exists()
+
+    @pytest.mark.asyncio
+    async def test_failed_hop_drops_the_session_so_a_retry_resends_everything(self):
+        llm = provider()
+        seen: list[tuple] = []
+
+        async def flaky(prompt: str, session=None, resume: bool = False) -> str:
+            seen.append((prompt, session, resume))
+            if len(seen) == 2:
+                raise LLMError("claude_timeout", seconds=1)
+            return _read("a.py")
+
+        llm._run = flaky  # type: ignore[method-assign]
+        convo: list[dict] = [{"role": "user", "content": "DIFF"}]
+        msg = await llm.complete_agentic(convo, tools=list(AGENTIC_TOOLS))
+        convo += [
+            {"role": "assistant", "content": "", "tool_calls": msg["tool_calls"]},
+            {"role": "tool", "tool_call_id": msg["tool_calls"][0]["id"], "content": "R"},
+        ]
+        with pytest.raises(LLMError):
+            await llm.complete_agentic(convo, tools=list(AGENTIC_TOOLS))
+        assert seen[1][2] is True
+        assert not seen[0][1].root.exists()
+
+        await llm.complete_agentic(convo, tools=list(AGENTIC_TOOLS))
+        assert seen[2][2] is False and "DIFF" in seen[2][0]
+        await llm.close_agentic(convo)
+
+    @pytest.mark.asyncio
+    async def test_run_uses_the_session_dirs_and_flags(self, token, spawn):
+        llm = provider()
+        session = llm._new_session()
+        mock = spawn(fake_process(json.dumps(envelope(result='{"tool_calls": []}')), 0))
+
+        await llm._run("p", session=session, resume=False)
+        await llm._run("p", session=session, resume=True)
+
+        first, later = (call.args for call in mock.await_args_list)
+        assert first[-2:] == ("--session-id", session.session_id)
+        assert later[-2:] == ("--resume", session.session_id)
+        kwargs = mock.await_args_list[0].kwargs
+        assert kwargs["cwd"] == str(session.root / "work")
+        assert kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(session.root / "config")
+        assert session.root.exists()  # kept between hops
+        llm._close_session(session)
+        assert not session.root.exists()
+
+    @pytest.mark.asyncio
+    async def test_tiered_provider_forwards_close_agentic(self):
+        from mira.llm.tiered import TieredProvider
+
+        llm, _ = _hop_loop_provider([_read("a.py")])
+        tiered = TieredProvider([(llm.config, llm)], cooldown_seconds=60)
+        convo: list[dict] = [{"role": "user", "content": "DIFF"}]
+        await llm.complete_agentic(convo, tools=list(AGENTIC_TOOLS))
+        assert llm._threads
+
+        await tiered.close_agentic(convo)
+
+        assert not llm._threads
+
+
+class TestCliVersionCheck:
+    def test_parse_cli_version(self):
+        from mira.llm.claude_cli import parse_cli_version
+
+        assert parse_cli_version("2.1.310 (Claude Code)\n") == (2, 1, 310)
+        assert parse_cli_version("nope") is None
+
+    @pytest.mark.asyncio
+    async def test_no_claude_tier_skips_the_check(self, spawn):
+        from mira.llm.claude_cli import log_claude_cli_version
+
+        mock = spawn(fake_process("", 0))
+        assert await log_claude_cli_version(LLMConfig(provider="openai", model="x")) is None
+        mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_logs_version_and_warns_when_too_old(self, spawn, caplog):
+        from mira.llm.claude_cli import log_claude_cli_version
+
+        config = LLMConfig(provider="claude-cli", model="claude-sonnet-5-5")
+        spawn(fake_process("2.1.310 (Claude Code)\n", 0))
+        with caplog.at_level("INFO", logger="mira.llm.claude_cli"):
+            assert await log_claude_cli_version(config) == "2.1.310"
+        assert "Claude Code CLI 2.1.310" in caplog.text
+        assert "older than" not in caplog.text
+
+        spawn(fake_process("2.1.270 (Claude Code)\n", 0))
+        with caplog.at_level("WARNING", logger="mira.llm.claude_cli"):
+            assert await log_claude_cli_version(config) == "2.1.270"
+        assert "older than 2.1.284" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_missing_cli_never_raises(self, monkeypatch):
+        from mira.llm.claude_cli import log_claude_cli_version
+
+        monkeypatch.setattr(
+            "asyncio.create_subprocess_exec", AsyncMock(side_effect=FileNotFoundError("claude"))
+        )
+        config = LLMConfig(provider="claude-cli", model="sonnet")
+        assert await log_claude_cli_version(config) is None

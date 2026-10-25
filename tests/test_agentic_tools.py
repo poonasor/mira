@@ -43,8 +43,8 @@ class TestReadFile:
         ex = _executor({"src/a.py": "alpha\nbeta\n"}, ["src/a.py"])
         out = await ex.execute("read_file", {"path": "src/a.py"})
         assert "src/a.py" in out
-        assert "    1  alpha" in out
-        assert "    2  beta" in out
+        assert "1  alpha" in out
+        assert "2  beta" in out
 
     @pytest.mark.asyncio
     async def test_truncates_huge_files(self):
@@ -132,3 +132,106 @@ class TestExecutorBudget:
         ex.bytes_used = 1_000_000  # simulate exhaustion
         out = await ex.execute("read_file", {"path": "a.py"})
         assert "budget exhausted" in out
+
+
+class TestOutputCaps:
+    @pytest.mark.asyncio
+    async def test_line_ranges_and_continuation_hint(self):
+        source = "\n".join(f"line{n}" for n in range(1, 101))
+        ex = AgenticToolExecutor(
+            source_fetcher=_FakeFetcher({"a.py": source}), repo_tree=["a.py"], max_file_chars=1_000
+        )
+        part = await ex.execute("read_file", {"path": "a.py", "start_line": 10, "end_line": 12})
+        assert "lines 10-12 of 100" in part
+        assert "10  line10" in part and "12  line12" in part and "line13" not in part
+
+        whole = await ex.execute("read_file", {"path": "a.py"})
+        assert "truncated at line" in whole and "start_line=" in whole
+        assert len(whole) < 1_200
+
+    @pytest.mark.asyncio
+    async def test_repeated_identical_calls_return_a_pointer(self):
+        ex = _executor({"a.py": "x = 1\n"}, ["a.py"])
+        first = await ex.execute("read_file", {"path": "a.py"})
+        again = await ex.execute("read_file", {"path": "a.py"})
+        assert "x = 1" in first
+        assert "already returned" in again and "x = 1" not in again
+        g1 = await ex.execute("grep_repo", {"pattern": "x"})
+        g2 = await ex.execute("grep_repo", {"pattern": "x"})
+        assert "already answered" in g2 and len(g2) < len(g1) + 60
+
+    @pytest.mark.asyncio
+    async def test_total_budget_truncates_then_refuses(self):
+        files = {f"f{i}.py": "y" * 900 for i in range(5)}
+        ex = AgenticToolExecutor(
+            source_fetcher=_FakeFetcher(files),
+            repo_tree=list(files),
+            max_file_chars=1_000,
+            max_total_chars=2_000,
+        )
+        outs = [await ex.execute("read_file", {"path": p}) for p in files]
+        assert "tool output budget used up" in "".join(outs)
+        assert sum(len(o) for o in outs) < 2_000 + 5 * 200
+        assert ex.budget_exhausted
+
+    def test_limits_come_from_review_config(self):
+        from mira.config import ReviewConfig
+
+        review = ReviewConfig(
+            agentic_max_hops=3,
+            agentic_max_file_chars=4_000,
+            agentic_max_total_chars=9_000,
+            agentic_max_grep_hits=5,
+        )
+        ex = AgenticToolExecutor.from_review_config(review, _FakeFetcher({}), [])
+        assert (ex.max_hops, ex.max_file_chars, ex.max_total_chars, ex.max_grep_hits) == (
+            3,
+            4_000,
+            9_000,
+            5,
+        )
+        defaults = AgenticToolExecutor.from_review_config(ReviewConfig(), _FakeFetcher({}), [])
+        assert defaults.max_hops == 6
+
+    def test_config_rejects_out_of_range_limits(self):
+        from pydantic import ValidationError
+
+        from mira.config import ReviewConfig
+
+        with pytest.raises(ValidationError):
+            ReviewConfig(agentic_max_hops=0)
+        with pytest.raises(ValidationError):
+            ReviewConfig(agentic_max_file_chars=10)
+
+
+class TestLoopHopBudget:
+    @pytest.mark.asyncio
+    async def test_configured_hops_bound_the_loop_and_last_hop_says_submit(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from mira.core.passes import agentic_review_loop
+
+        read = {
+            "content": "",
+            "tool_calls": [
+                {"id": "c", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}
+            ],
+        }
+        llm = MagicMock()
+        last_messages: list[str] = []
+
+        async def hop(convo, tools):
+            last_messages.append(str(convo[-1].get("content")))
+            return read
+
+        llm.complete_agentic = AsyncMock(side_effect=hop)
+        llm.close_agentic = AsyncMock()
+        ex = _executor({"a.py": "x\n"}, ["a.py"])
+        ex.max_hops = 3
+
+        assert await agentic_review_loop(llm, [{"role": "system", "content": "s"}], ex) == ""
+
+        assert llm.complete_agentic.await_count == 3
+        assert "must call submit_review" in last_messages[2]
+        assert not any("must call submit_review" in m for m in last_messages[:2])
+        llm.close_agentic.assert_awaited_once()

@@ -1395,7 +1395,8 @@ class ReviewEngine:
                     if use_agentic:
                         from mira.llm.agentic_tools import AgenticToolExecutor
 
-                        executor = AgenticToolExecutor(
+                        executor = AgenticToolExecutor.from_review_config(
+                            self.config.review,
                             source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
                             repo_tree=list(self._agentic_repo_tree),
                         )
@@ -1479,7 +1480,8 @@ class ReviewEngine:
             from mira.llm.agentic_tools import AgenticToolExecutor
 
             def _security_executor_factory() -> AgenticToolExecutor:
-                return AgenticToolExecutor(
+                return AgenticToolExecutor.from_review_config(
+                    self.config.review,
                     source_fetcher=self._agentic_source_fetcher,
                     repo_tree=list(self._agentic_repo_tree),
                 )

@@ -26,19 +26,25 @@ READ_FILE_TOOL = {
     "function": {
         "name": "read_file",
         "description": (
-            "Read a file from the repository at the PR head. Use this to verify "
-            "cross-file claims (does function X exist? what does the caller pass?) "
-            "before filing a comment. Prefer reading specific files over guessing. "
-            "Returns the file content with line numbers."
+            "Read a file from the repository at the PR head, with line numbers. "
+            "Use it to verify cross-file claims before filing a comment. Long "
+            "files are truncated; pass start_line/end_line to read just the "
+            "part you need."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": (
-                        "Repo-relative path of the file to read, e.g. `src/auth/middleware.py`."
-                    ),
+                    "description": "Repo-relative path, e.g. `src/auth/middleware.py`.",
+                },
+                "start_line": {
+                    "type": ["integer", "null"],
+                    "description": "Optional first line to return (1-based).",
+                },
+                "end_line": {
+                    "type": ["integer", "null"],
+                    "description": "Optional last line to return (inclusive).",
                 },
             },
             "required": ["path"],
@@ -90,7 +96,9 @@ GREP_REPO_TOOL = {
 }
 
 
-# Hard caps to keep tool output from blowing up the prompt or the API budget.
+# Default caps to keep tool output from blowing up the prompt or the API
+# budget; `review.agentic_*` settings override them per deployment.
+DEFAULT_MAX_HOPS = 6
 _MAX_FILE_BYTES = 12_000  # ~3k tokens of source; truncate larger files
 _MAX_GREP_HITS = 30
 _MAX_GREP_BYTES_PER_HIT = 240
@@ -109,9 +117,35 @@ class AgenticToolExecutor:
 
     source_fetcher: SourceFetcher
     repo_tree: list[str]
+    # Model calls per chunk, including the final submit_review hop.
+    max_hops: int = DEFAULT_MAX_HOPS
+    max_file_chars: int = _MAX_FILE_BYTES
+    max_total_chars: int = _MAX_TOTAL_OUTPUT_BYTES
+    max_grep_hits: int = _MAX_GREP_HITS
     bytes_used: int = 0
     _content_cache: dict[str, str | None] = field(default_factory=dict)
+    # Calls already answered in full; a repeat gets a short pointer instead
+    # of the same output again (the earlier result is still in the context).
+    _answered: set[tuple] = field(default_factory=set)
     call_log: list[dict] = field(default_factory=list)
+
+    @classmethod
+    def from_review_config(
+        cls, review: object, source_fetcher: SourceFetcher, repo_tree: list[str]
+    ) -> AgenticToolExecutor:
+        """Build an executor with the `review.agentic_*` limits from config."""
+        return cls(
+            source_fetcher=source_fetcher,
+            repo_tree=repo_tree,
+            max_hops=getattr(review, "agentic_max_hops", DEFAULT_MAX_HOPS),
+            max_file_chars=getattr(review, "agentic_max_file_chars", _MAX_FILE_BYTES),
+            max_total_chars=getattr(review, "agentic_max_total_chars", _MAX_TOTAL_OUTPUT_BYTES),
+            max_grep_hits=getattr(review, "agentic_max_grep_hits", _MAX_GREP_HITS),
+        )
+
+    @property
+    def budget_exhausted(self) -> bool:
+        return self.bytes_used >= self.max_total_chars
 
     async def execute(self, name: str, args: dict) -> str:
         """Dispatch a tool call. Returns the tool result as a string.
@@ -124,21 +158,29 @@ class AgenticToolExecutor:
         arg = (args or {}).get("path") or (args or {}).get("pattern") or ""
         self.call_log.append({"tool": name, "arg": arg})
 
-        if self.bytes_used >= _MAX_TOTAL_OUTPUT_BYTES:
+        if self.budget_exhausted:
             return "[tool budget exhausted — no more tool calls accepted; submit your review now]"
 
+        args = args or {}
         try:
             if name == "read_file":
-                path = (args or {}).get("path") or ""
+                path = args.get("path") or ""
                 if not path:
                     return "[error: missing `path` argument]"
-                result = await self._read_file(path)
+                start, end = _line_arg(args.get("start_line")), _line_arg(args.get("end_line"))
+                key: tuple = (name, path, start, end)
+                if key in self._answered:
+                    return f"[`{path}` was already returned above with the same lines]"
+                result = await self._read_file(path, start, end)
             elif name == "grep_repo":
-                pattern = (args or {}).get("pattern") or ""
+                pattern = args.get("pattern") or ""
                 if not pattern:
                     return "[error: missing `pattern` argument]"
-                path_glob = (args or {}).get("path_glob") or None
-                path_only = bool((args or {}).get("path_only") or False)
+                path_glob = args.get("path_glob") or None
+                path_only = bool(args.get("path_only") or False)
+                key = (name, pattern, path_glob, path_only)
+                if key in self._answered:
+                    return f"[grep for `{pattern}` was already answered above]"
                 result = await self._grep_repo(pattern, path_glob, path_only)
             else:
                 return f"[error: unknown tool `{name}`]"
@@ -146,10 +188,15 @@ class AgenticToolExecutor:
             logger.debug("Tool %s failed: %s", name, exc)
             return f"[error executing `{name}`: {exc}]"
 
+        if not result.startswith("["):
+            self._answered.add(key)
+        remaining = self.max_total_chars - self.bytes_used
+        if len(result) > remaining:
+            result = result[:remaining] + "\n... [truncated: tool output budget used up]"
         self.bytes_used += len(result)
         return result
 
-    async def _read_file(self, path: str) -> str:
+    async def _read_file(self, path: str, start: int | None = None, end: int | None = None) -> str:
         # Don't waste tokens hunting for files we know don't exist.
         if self.repo_tree and path not in self.repo_tree:
             close = [p for p in self.repo_tree if path.lower() in p.lower()][:5]
@@ -165,17 +212,36 @@ class AgenticToolExecutor:
         if content is None:
             return f"[failed to read `{path}`]"
 
-        truncated = False
-        if len(content) > _MAX_FILE_BYTES:
-            content = content[:_MAX_FILE_BYTES]
-            truncated = True
+        lines = content.split("\n")
+        total = len(lines)
+        first = max(1, start or 1)
+        last = min(total, end or total)
+        if first > total or last < first:
+            return f"[`{path}` has {total} lines; requested {start}-{end}]"
 
         # Number lines so the LLM can cite them by number when filing comments.
-        numbered = "\n".join(f"{i + 1:>5}  {line}" for i, line in enumerate(content.split("\n")))
-        suffix = (
-            f"\n... [truncated; file is longer than {_MAX_FILE_BYTES} bytes]" if truncated else ""
-        )
-        return f"`{path}`:\n```\n{numbered}{suffix}\n```"
+        out: list[str] = []
+        used = 0
+        shown_last = first - 1
+        suffix = ""
+        for number in range(first, last + 1):
+            row = f"{number}  {lines[number - 1]}"
+            if used + len(row) > self.max_file_chars:
+                if not out:
+                    out.append(row[: self.max_file_chars])
+                    shown_last = number
+                    suffix = f"\n... [truncated: line {number} is longer than the read limit]"
+                break
+            out.append(row)
+            used += len(row) + 1
+            shown_last = number
+        if shown_last < last:
+            suffix = (
+                f"\n... [truncated at line {shown_last} of {total}; "
+                f"call read_file with start_line={shown_last + 1} for more]"
+            )
+        span = "" if (first, last) == (1, total) else f" lines {first}-{shown_last} of {total}"
+        return f"`{path}`{span}:\n```\n" + "\n".join(out) + f"{suffix}\n```"
 
     async def _grep_repo(self, pattern: str, path_glob: str | None, path_only: bool) -> str:
         if not self.repo_tree:
@@ -192,9 +258,9 @@ class AgenticToolExecutor:
                 rx = re.compile(pattern)
             except re.error:
                 # Treat as substring on regex error.
-                path_hits = [p for p in candidates if pattern in p][:_MAX_GREP_HITS]
+                path_hits = [p for p in candidates if pattern in p][: self.max_grep_hits]
             else:
-                path_hits = [p for p in candidates if rx.search(p)][:_MAX_GREP_HITS]
+                path_hits = [p for p in candidates if rx.search(p)][: self.max_grep_hits]
             if not path_hits:
                 return f"[no path matches for `{pattern}`]"
             return "Path matches:\n" + "\n".join(f"- `{p}`" for p in path_hits)
@@ -231,7 +297,7 @@ class AgenticToolExecutor:
         max_files_to_scan = 15
 
         for cand in candidates:
-            if len(hits) >= _MAX_GREP_HITS or files_scanned >= max_files_to_scan:
+            if len(hits) >= self.max_grep_hits or files_scanned >= max_files_to_scan:
                 break
             if any(cand.endswith(ext) for ext in skip_exts):
                 continue
@@ -252,15 +318,23 @@ class AgenticToolExecutor:
                     if len(snippet) > _MAX_GREP_BYTES_PER_HIT:
                         snippet = snippet[:_MAX_GREP_BYTES_PER_HIT] + "…"
                     hits.append(f"{cand}:{lineno}: {snippet}")
-                    if len(hits) >= _MAX_GREP_HITS:
+                    if len(hits) >= self.max_grep_hits:
                         break
 
         if not hits:
             return f"[no content matches for `{pattern}` (scanned {files_scanned} files)]"
         prefix = f"Content matches (scanned {files_scanned} files):"
-        if len(hits) == _MAX_GREP_HITS:
-            prefix += f" showing first {_MAX_GREP_HITS}"
+        if len(hits) == self.max_grep_hits:
+            prefix += f" showing first {self.max_grep_hits}"
         return prefix + "\n" + "\n".join(hits)
+
+
+def _line_arg(value: object) -> int | None:
+    try:
+        number = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 AGENTIC_TOOLS = [READ_FILE_TOOL, GREP_REPO_TOOL]
