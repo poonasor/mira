@@ -623,3 +623,28 @@ class TestCliVersionCheck:
         )
         config = LLMConfig(provider="claude-cli", model="sonnet")
         assert await log_claude_cli_version(config) is None
+
+
+class TestEffortOnAgenticSessions:
+    @pytest.mark.asyncio
+    async def test_effort_is_passed_on_first_and_resumed_agentic_hops(self, token, spawn):
+        llm = provider(model="claude-sonnet-5-5", reasoning_effort="medium")
+        reply = json.dumps(envelope(result=_read("a.py")))
+        mock = spawn(fake_process(reply, 0))
+        convo: list[dict] = [{"role": "user", "content": "DIFF"}]
+
+        msg = await llm.complete_agentic(convo, tools=list(AGENTIC_TOOLS))
+        call = msg["tool_calls"][0]
+        convo += [
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": call["id"], "content": "R"},
+        ]
+        await llm.complete_agentic(convo, tools=list(AGENTIC_TOOLS))
+        await llm.close_agentic(convo)
+
+        first, resumed = (c.args for c in mock.await_args_list)
+        assert "--session-id" in first and "--resume" in resumed
+        for cmd in (first, resumed):
+            assert "--effort=medium" in cmd
+            assert "--model=claude-sonnet-5-5" in cmd
+            assert "--no-session-persistence" not in cmd
