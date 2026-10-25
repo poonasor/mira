@@ -130,6 +130,10 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Codex CLI response did not contain a JSON object: {excerpt}",
         safe="Codex CLI response did not contain a JSON object",
     ),
+    "codex_invalid_tool_call": ErrorMessage(
+        full="Codex CLI returned an invalid tool call: {reason}",
+        safe="Codex CLI returned an invalid tool call",
+    ),
     # Claude Code CLI provider errors
     "claude_token_missing": ErrorMessage(
         full="Claude subscription token not found: set {token_env} to the token from `claude setup-token`.",
@@ -178,6 +182,10 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
     "claude_no_json_object": ErrorMessage(
         full="Claude Code CLI response did not contain a JSON object: {excerpt}",
         safe="Claude Code CLI response did not contain a JSON object",
+    ),
+    "claude_invalid_tool_call": ErrorMessage(
+        full="Claude Code CLI returned an invalid tool call: {reason}",
+        safe="Claude Code CLI returned an invalid tool call",
     ),
     # Cross-provider failover
     "all_providers_failed": ErrorMessage(

@@ -293,8 +293,10 @@ The official Mira image includes a pinned Claude Code CLI. Each call runs
 `claude -p` in an empty temporary directory with a minimal environment — only
 the subscription token is passed, never `ANTHROPIC_API_KEY` or Mira's service
 credentials — and with no tools, MCP servers, hooks, settings, slash commands,
-or saved session. Provider choice, the token variable, and all failover settings
-are deployment-only, as are `base_url` and `api_key_env`: repository
+or saved session. Agentic review hops still run on it: the model names the
+`read_file`/`grep_repo` calls it wants as JSON, and Mira runs them itself.
+Provider choice, the token variable, and all failover settings are
+deployment-only, as are `base_url` and `api_key_env`: repository
 `.mira.yaml` files cannot set them. Automated use draws on the subscription's
 usage limits; `claude_max_concurrency` caps how many CLI processes run at once.
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -8,6 +11,7 @@ import pytest
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm import create_llm, tiered
+from mira.llm.agentic_tools import AGENTIC_TOOLS
 from mira.llm.claude_cli import ClaudeCLIProvider
 from mira.llm.tiered import TieredProvider, is_health_failure, tier_key
 
@@ -306,3 +310,134 @@ class TestProtocolSurface:
         assert failover_cfg is CLAUDE
         assert isinstance(failover, ClaudeCLIProvider)
         assert provider.cooldown_seconds == 300
+
+
+GLM = LLMConfig(
+    provider="openai",
+    base_url="https://api.z.ai/api/coding/paas/v4",
+    api_key_env="ZAI_API_KEY",
+    model="glm-5.3-flash",
+    max_context_tokens=200_000,
+)
+SONNET = LLMConfig(provider="claude-cli", model="claude-sonnet-5-5", max_context_tokens=1_000_000)
+READ_CALL = '{"tool_calls": [{"name": "read_file", "arguments": {"path": "a.py"}}]}'
+
+
+def claude_envelope(result: str) -> str:
+    return json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": result})
+
+
+@pytest.fixture
+def claude_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test-token")
+
+
+def claude_process(stdout: str, returncode: int = 0) -> MagicMock:
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.pid = 4321
+    proc.communicate = AsyncMock(return_value=(stdout.encode(), b""))
+    return proc
+
+
+class TestAgenticClaudeCLI:
+    @pytest.mark.asyncio
+    async def test_agentic_calls_route_to_claude_cli_with_sonnet_5_5(
+        self, clock: list[float], claude_token, monkeypatch: pytest.MonkeyPatch
+    ):
+        spawn = AsyncMock(return_value=claude_process(claude_envelope(READ_CALL)))
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        glm = FakeProvider(result={"content": "", "tool_calls": []})
+        provider = create_llm(SONNET.model_copy(update={"failover": GLM}))
+        assert isinstance(provider, TieredProvider)
+        provider.tiers[1] = (GLM, glm)  # type: ignore[attr-defined]
+
+        msg = await provider.complete_agentic(MESSAGES, tools=list(AGENTIC_TOOLS))
+
+        assert msg["tool_calls"][0]["function"]["name"] == "read_file"
+        assert provider.last_tier == "tier 1 (claude-cli:claude-sonnet-5-5)"  # type: ignore[attr-defined]
+        assert glm.calls == 0
+        cmd = spawn.await_args.args
+        assert cmd[0] == "claude"
+        assert "--model=claude-sonnet-5-5" in cmd
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failure", "reason"),
+        [
+            (FileNotFoundError(), "claude_command_not_found"),
+            (
+                claude_process(
+                    '{"type": "result", "is_error": true, "api_error_status": 500, '
+                    '"result": "overloaded"}',
+                    1,
+                ),
+                "claude_api_error",
+            ),
+            (claude_process("Segmentation fault", 139), "claude_exit_failed"),
+        ],
+        ids=["missing-binary", "api-error", "crash"],
+    )
+    async def test_claude_cli_failure_falls_back_to_glm_and_warns(
+        self,
+        failure: object,
+        reason: str,
+        clock: list[float],
+        claude_token,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        spawn = (
+            AsyncMock(side_effect=failure)
+            if isinstance(failure, BaseException)
+            else AsyncMock(return_value=failure)
+        )
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        from_glm = {"content": "", "tool_calls": [{"id": "x", "function": {"name": "read_file"}}]}
+        glm = FakeProvider(result=from_glm)
+        provider = TieredProvider(
+            [(SONNET, ClaudeCLIProvider(SONNET)), (GLM, glm)], cooldown_seconds=600
+        )
+
+        with caplog.at_level(logging.WARNING, logger="mira.llm.tiered"):
+            msg = await provider.complete_agentic(MESSAGES, tools=list(AGENTIC_TOOLS))
+
+        assert msg == from_glm
+        assert glm.calls == 1
+        assert provider.last_tier == "tier 2 (openai:glm-5.3-flash)"
+        [record] = [r for r in caplog.records if "failing over" in r.getMessage()]
+        assert "tier 1 (claude-cli:claude-sonnet-5-5)" in record.getMessage()
+        assert f"[{reason}]" in record.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_claude_cli_timeout_falls_back_to_glm_and_cools_down(
+        self, clock: list[float], claude_token, caplog: pytest.LogCaptureFixture
+    ):
+        claude = ClaudeCLIProvider(SONNET)
+        claude._run = AsyncMock(  # type: ignore[method-assign]
+            side_effect=LLMError("claude_timeout", seconds=900)
+        )
+        glm = FakeProvider(result={"content": "", "tool_calls": []})
+        provider = TieredProvider([(SONNET, claude), (GLM, glm)], cooldown_seconds=600)
+
+        with caplog.at_level(logging.WARNING, logger="mira.llm.tiered"):
+            await provider.complete_agentic(MESSAGES, tools=list(AGENTIC_TOOLS))
+            await provider.complete_agentic(MESSAGES, tools=list(AGENTIC_TOOLS))
+
+        assert claude._run.await_count == 1  # cooled down after the timeout
+        assert glm.calls == 2
+        assert any("[claude_timeout]" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_skipping_a_tier_without_tool_calling_is_logged(
+        self, clock: list[float], caplog: pytest.LogCaptureFixture
+    ):
+        provider = pair(FakeProvider(tools=False), FakeProvider(result={"tool_calls": []}))
+
+        with caplog.at_level(logging.WARNING, logger="mira.llm.tiered"):
+            await provider.complete_agentic(MESSAGES, tools=[])
+
+        assert any(
+            "Skipping tier 1" in r.getMessage() and "tool-calling" in r.getMessage()
+            for r in caplog.records
+        )

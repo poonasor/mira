@@ -3,6 +3,11 @@
 Callers pass Mira's existing chat messages and tool schemas and receive the
 same JSON strings an HTTP provider would return. Subclasses only supply
 ``_run(prompt)``, which executes the CLI and returns its final answer text.
+
+Agentic tool use is emulated over plain text: each hop renders the conversation
+and the tool schemas into one prompt, the model answers with a JSON object
+naming the tool calls it wants, and Mira executes them itself. The CLI never
+gets tools of its own, so the sandboxing above is unchanged.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ import asyncio
 import json
 import os
 import signal
+import uuid
 from contextlib import suppress
 
 from mira.config import LLMConfig
@@ -37,6 +43,9 @@ class CLIProviderBase:
     """Base for providers that execute a model through a local CLI."""
 
     supports_json_mode: bool = True
+    # Whether complete_agentic runs a real hop (text-emulated tool calls) or
+    # defers straight to one forced review. TieredProvider routes agentic
+    # calls only to tiers where this is True.
     supports_tool_calling: bool = False
     supports_temperature: bool = False
     supports_max_tokens: bool = False
@@ -96,9 +105,84 @@ class CLIProviderBase:
         ]
         for i, message in enumerate(messages, 1):
             role = message.get("role", "user")
-            content = message.get("content", "")
+            content = message.get("content") or ""
+            if role == "tool":
+                call_id = message.get("tool_call_id") or ""
+                parts.append(f"\n### Message {i}: tool result for call {call_id}\n{content}")
+                continue
             parts.append(f"\n### Message {i}: {role}\n{content}")
+            calls = [
+                {
+                    "id": call.get("id") or "",
+                    "name": (call.get("function") or {}).get("name") or "",
+                    "arguments": (call.get("function") or {}).get("arguments") or "{}",
+                }
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict)
+            ]
+            if calls:
+                parts.append("Tool calls made:\n" + json.dumps(calls, indent=2))
         return "\n".join(parts)
+
+    def _agentic_prompt(self, messages: list[dict], tools: list[dict]) -> str:
+        specs = [
+            {
+                "name": (tool.get("function") or {}).get("name"),
+                "description": (tool.get("function") or {}).get("description", ""),
+                "parameters": (tool.get("function") or {}).get("parameters") or {"type": "object"},
+            }
+            for tool in tools
+        ]
+        return (
+            self._messages_prompt(messages)
+            + "\n\n## Tools\n"
+            + "You can call these tools. Mira runs them and sends back the results.\n"
+            + json.dumps(specs, indent=2, sort_keys=True)
+            + "\n\n## Required output\n"
+            + "Return ONLY one JSON object of the form "
+            + '{"tool_calls": [{"name": "<tool name>", "arguments": {...}}]}.\n'
+            + "Each `arguments` object must conform to that tool's `parameters` schema.\n"
+            + "To finish, call the terminal submit tool with your complete result.\n"
+            + "Do not wrap the JSON in markdown fences. Do not include explanatory text."
+        )
+
+    def _parse_tool_calls(self, raw: str, tools: list[dict]) -> dict:
+        """Turn the model's JSON answer into an OpenAI-style assistant message."""
+        known = {(tool.get("function") or {}).get("name") for tool in tools}
+        payload = json.loads(self._extract_json_object(raw))
+        requested = payload.get("tool_calls")
+        if requested is None:
+            requested = []
+        if not isinstance(requested, list):
+            raise self._error("invalid_tool_call", reason="`tool_calls` is not a list")
+        content = payload.get("content")
+        calls: list[dict] = []
+        for index, call in enumerate(requested):
+            if not isinstance(call, dict):
+                raise self._error("invalid_tool_call", reason=f"call {index} is not an object")
+            name = call.get("name")
+            if name not in known:
+                raise self._error("invalid_tool_call", reason=f"unknown tool {name!r}")
+            arguments = call.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError as exc:
+                    raise self._error(
+                        "invalid_tool_call", reason=f"arguments for {name} are not JSON"
+                    ) from exc
+            if not isinstance(arguments, dict):
+                raise self._error(
+                    "invalid_tool_call", reason=f"arguments for {name} are not an object"
+                )
+            calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+            )
+        return {"content": content if isinstance(content, str) else "", "tool_calls": calls}
 
     def _tool_prompt(self, messages: list[dict], tools: list[dict]) -> str:
         tool = tools[0].get("function", {}) if tools else {}
@@ -202,9 +286,14 @@ class CLIProviderBase:
         tools: list[dict],
         temperature: float | None = None,
     ) -> dict:
-        # CLIs don't expose Mira's incremental OpenAI-style tool calls. Defer
-        # immediately so the caller performs exactly one forced review.
-        return {"content": "", "tool_calls": []}
+        if not self.supports_tool_calling:
+            # Defer immediately so the caller performs exactly one forced review.
+            return {"content": "", "tool_calls": []}
+        prompt = self._agentic_prompt(messages, tools)
+        raw = await self._run(prompt)
+        message = self._parse_tool_calls(raw, tools)
+        self._record_estimated_usage(prompt, raw)
+        return message
 
     async def review(self, messages: list[dict[str, str]], temperature: float | None = None) -> str:
         from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL

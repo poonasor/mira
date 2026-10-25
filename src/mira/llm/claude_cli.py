@@ -4,7 +4,8 @@ The OAuth token comes from ``claude setup-token`` and reaches the child process
 only as ``CLAUDE_CODE_OAUTH_TOKEN``; no Anthropic API key is read or sent. The
 prompt carries untrusted pull-request content, so the CLI runs with no tools,
 settings, hooks, MCP servers, slash commands, or saved session, in an empty
-working directory.
+working directory. Agentic review hops still work: the model names the
+read_file/grep_repo calls it wants as JSON and Mira runs them (see cli_base).
 """
 
 from __future__ import annotations
@@ -48,6 +49,9 @@ class ClaudeCLIProvider(CLIProviderBase):
     backend_label = "Claude Code CLI"
     error_prefix = "claude"
     records_own_usage = True
+    # Agentic hops are emulated over text (see cli_base), so the CLI itself
+    # still runs with `--tools ""` while Mira executes read_file/grep_repo.
+    supports_tool_calling = True
 
     def _token(self) -> str:
         token_env = self.config.claude_oauth_token_env

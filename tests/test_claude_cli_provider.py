@@ -10,7 +10,9 @@ import pytest
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm import create_llm
+from mira.llm.agentic_tools import AGENTIC_TOOLS
 from mira.llm.claude_cli import ClaudeCLIProvider
+from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claude_cli"
 TOKEN = "sk-ant-oat01-test-token"
@@ -315,15 +317,101 @@ class TestProtocol:
         assert "Claude Code CLI" in prompt
         assert "`submit_review`" in prompt
 
-    @pytest.mark.asyncio
-    async def test_complete_agentic_defers_to_a_single_forced_review(self):
-        llm = provider()
-        llm._run = AsyncMock()  # type: ignore[method-assign]
+    def test_claude_cli_supports_agentic_tool_calling(self):
+        assert provider().supports_tool_calling is True
 
-        msg = await llm.complete_agentic([{"role": "user", "content": "hi"}], tools=[])
+    @pytest.mark.asyncio
+    async def test_complete_agentic_returns_openai_style_tool_calls(self):
+        llm = provider(model="claude-sonnet-5-5")
+        llm._run = AsyncMock(  # type: ignore[method-assign]
+            return_value='{"tool_calls": [{"name": "read_file", "arguments": {"path": "a.py"}}]}'
+        )
+
+        msg = await llm.complete_agentic(
+            [{"role": "user", "content": "hi"}], tools=[*AGENTIC_TOOLS, SUBMIT_REVIEW_TOOL]
+        )
+
+        [call] = msg["tool_calls"]
+        assert call["type"] == "function"
+        assert call["id"].startswith("call_")
+        assert call["function"]["name"] == "read_file"
+        assert json.loads(call["function"]["arguments"]) == {"path": "a.py"}
+        prompt = llm._run.await_args.args[0]
+        assert '"read_file"' in prompt and '"submit_review"' in prompt
+
+    @pytest.mark.asyncio
+    async def test_complete_agentic_replays_tool_results_into_the_next_prompt(self):
+        llm = provider()
+        llm._run = AsyncMock(return_value='{"tool_calls": []}')  # type: ignore[method-assign]
+        convo = [
+            {"role": "user", "content": "review"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "1: def f(): pass"},
+        ]
+
+        msg = await llm.complete_agentic(convo, tools=list(AGENTIC_TOOLS))
 
         assert msg == {"content": "", "tool_calls": []}
-        llm._run.assert_not_awaited()
+        prompt = llm._run.await_args.args[0]
+        assert "tool result for call call_1" in prompt
+        assert "1: def f(): pass" in prompt
+        assert '"name": "read_file"' in prompt
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '{"tool_calls": [{"name": "run_shell", "arguments": {}}]}',
+            '{"tool_calls": [{"name": "read_file", "arguments": "not json"}]}',
+            '{"tool_calls": [{"name": "read_file", "arguments": [1]}]}',
+            '{"tool_calls": "read_file"}',
+        ],
+        ids=["unknown-tool", "string-args", "list-args", "not-a-list"],
+    )
+    async def test_invalid_tool_calls_raise_a_claude_error(self, raw: str):
+        llm = provider()
+        llm._run = AsyncMock(return_value=raw)  # type: ignore[method-assign]
+
+        with pytest.raises(LLMError) as info:
+            await llm.complete_agentic([{"role": "user", "content": "hi"}], tools=AGENTIC_TOOLS)
+
+        assert info.value.code == "claude_invalid_tool_call"
+
+    @pytest.mark.asyncio
+    async def test_agentic_review_loop_runs_tools_then_submits_through_claude_cli(self):
+        from mira.core.passes import agentic_review_loop
+
+        review = {"comments": [], "summary": "looks fine"}
+        llm = provider(model="claude-sonnet-5-5")
+        llm._run = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                '{"tool_calls": [{"name": "read_file", "arguments": {"path": "a.py"}}]}',
+                json.dumps({"tool_calls": [{"name": "submit_review", "arguments": review}]}),
+            ]
+        )
+        executor = MagicMock()
+        executor.execute = AsyncMock(return_value="1: x = 1")
+
+        raw = await agentic_review_loop(
+            llm,
+            [{"role": "system", "content": "review"}, {"role": "user", "content": "d"}],
+            executor,
+        )
+
+        assert json.loads(raw) == review
+        executor.execute.assert_awaited_once_with("read_file", {"path": "a.py"})
+        second_prompt = llm._run.await_args_list[1].args[0]
+        assert "1: x = 1" in second_prompt
 
     def test_json_extraction_errors_use_claude_codes(self):
         with pytest.raises(LLMError) as info:

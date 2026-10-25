@@ -79,6 +79,13 @@ def is_health_failure(exc: BaseException) -> bool:
     return False
 
 
+def _failure_reason(exc: BaseException) -> str:
+    """A short machine-readable reason for a tier failure, for the failover log."""
+    if isinstance(exc, LLMError):
+        return exc.code
+    return type(exc).__name__
+
+
 def _prompt_text(messages: list) -> str:
     return "\n".join(str(m.get("content") or "") for m in messages if isinstance(m, dict))
 
@@ -144,6 +151,7 @@ class TieredProvider:
         for index, cfg, provider in self._candidates():
             name = f"tier {index + 1} ({cfg.provider}:{cfg.model})"
             if agentic and not getattr(provider, "supports_tool_calling", False):
+                logger.warning("Skipping %s for agentic call: no tool-calling support", name)
                 continue
             if provider.count_tokens(prompt) > cfg.max_context_tokens:
                 logger.warning(
@@ -155,19 +163,24 @@ class TieredProvider:
                 result = await getattr(provider, method)(messages, *args, **kwargs)
             except Exception as exc:
                 last_exc = exc
+                reason = _failure_reason(exc)
                 errors.append(
                     f"{name}: {exc.safe_message if isinstance(exc, MiraError) else type(exc).__name__}"
                 )
                 if is_health_failure(exc):
                     _cooldowns[tier_key(cfg)] = _now() + self.cooldown_seconds
                     logger.warning(
-                        "%s failed (%s); cooling it down for %ds and failing over",
+                        "%s %s failed [%s] (%s); cooling it down for %ds and failing over",
                         name,
+                        method,
+                        reason,
                         exc,
                         self.cooldown_seconds,
                     )
                 else:
-                    logger.warning("%s failed (%s); failing over", name, exc)
+                    logger.warning(
+                        "%s %s failed [%s] (%s); failing over", name, method, reason, exc
+                    )
                 continue
             finally:
                 self._sync_usage()
