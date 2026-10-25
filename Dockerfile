@@ -1,7 +1,7 @@
 # ── Stage 1: build the React UI ───────────────────────────────────
 FROM node:20-slim AS ui-builder
 ARG CODEX_VERSION=0.154.0
-ARG CLAUDE_CODE_VERSION=2.1.270
+ARG CLAUDE_CODE_VERSION=2.1.308
 WORKDIR /ui
 COPY ui/mira/package.json ui/mira/package-lock.json ./
 RUN npm ci --no-audit --no-fund
