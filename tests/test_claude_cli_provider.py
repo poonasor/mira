@@ -89,6 +89,14 @@ class TestCommand:
             "--no-session-persistence",
         ]
 
+    def test_reasoning_effort_is_passed_as_effort_flag(self):
+        assert "--effort=medium" in provider(reasoning_effort="medium")._command()
+
+    def test_no_effort_flag_when_effort_is_unset_or_off(self):
+        for effort in (None, "off", "bogus"):
+            cmd = provider(reasoning_effort=effort)._command()
+            assert not any(arg.startswith("--effort") for arg in cmd)
+
     def test_model_is_bound_to_its_flag_so_it_cannot_inject_options(self):
         cmd = provider(model="--dangerously-skip-permissions")._command()
 

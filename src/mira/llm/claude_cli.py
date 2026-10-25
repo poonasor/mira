@@ -128,6 +128,10 @@ class ClaudeCLIProvider(CLIProviderBase):
                 f"Invalid claude_command: {command!r}. "
                 "Set it to a single executable path/name without arguments."
             )
+        effort = self.config.reasoning_effort
+        effort_args = (
+            [f"--effort={effort}"] if effort in ("low", "medium", "high", "xhigh", "max") else []
+        )
         return [
             command,
             "-p",
@@ -135,6 +139,7 @@ class ClaudeCLIProvider(CLIProviderBase):
             "json",
             # Bound form, so a model id starting with "-" can't become an option.
             f"--model={self.config.model}",
+            *effort_args,
             "--tools",
             "",
             "--max-turns",
