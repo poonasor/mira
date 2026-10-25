@@ -259,42 +259,48 @@ Don't mount your personal `~/.codex`. The container could read and change your
 other Codex state, and your own Codex sessions don't take Mira's lock, so they
 can spend the same refresh token as Mira.
 
-### Claude CLI failover
+### Claude CLI primary, GLM failover
 
-Mira can fail over from its primary provider to Claude through the Claude Code
-CLI, authenticated with a Claude subscription instead of an Anthropic API key.
-Create a long-lived token with `claude setup-token` and pass it to the container
-as `CLAUDE_CODE_OAUTH_TOKEN`:
+The recommended setup runs reviews on Claude Sonnet 5.5 through the Claude Code
+CLI, authenticated with a Claude subscription instead of an Anthropic API key,
+and fails over to Z.AI GLM. Create a long-lived token with `claude setup-token`
+and pass it to the container as `CLAUDE_CODE_OAUTH_TOKEN`:
 
 ```yaml
 # mira.yaml
 llm:
-  base_url: "https://api.z.ai/api/paas/v4"   # primary provider, unchanged
-  api_key_env: "ZAI_API_KEY"
-  model: "glm-5.2"
+  provider: "claude-cli"            # primary: Claude Code CLI
+  model: "claude-sonnet-5-5"
+  max_context_tokens: 1000000
+  claude_oauth_token_env: "CLAUDE_CODE_OAUTH_TOKEN"   # optional; this is the default
+  claude_max_concurrency: 2                           # optional
   failover_cooldown_seconds: 600    # skip the primary this long after a provider-side failure
   failover_primary_max_retries: 1   # retry the primary less so failover happens quickly
-  failover:
-    provider: "claude-cli"
-    model: "sonnet"
-    max_context_tokens: 1000000
-    claude_oauth_token_env: "CLAUDE_CODE_OAUTH_TOKEN"   # optional; this is the default
-    claude_max_concurrency: 2                           # optional
+  failover:                         # failover: Z.AI GLM
+    provider: "openai"
+    api_style: "chat"
+    base_url: "https://api.z.ai/api/paas/v4"
+    api_key_env: "ZAI_API_KEY"
+    model: "glm-5.2"
 ```
 
 A call that fails on the primary is re-sent to the failover provider. Rate
 limits, 5xx responses, timeouts, network errors, and auth errors also put the
 primary into a cooldown, so later calls go straight to the failover provider
 until it expires. Dashboard model overrides apply to the primary only; the
-failover provider uses the models in its own block. `provider: "claude-cli"`
-also works on its own, without failover.
+failover provider uses the models in its own block. The tiers can be swapped
+(GLM primary, `claude-cli` failover), and `provider: "claude-cli"` also works on
+its own, without failover.
 
-The official Mira image includes a pinned Claude Code CLI. Each call runs
-`claude -p` in an empty temporary directory with a minimal environment — only
-the subscription token is passed, never `ANTHROPIC_API_KEY` or Mira's service
-credentials — and with no tools, MCP servers, hooks, settings, slash commands,
-or saved session. Agentic review hops still run on it: the model names the
-`read_file`/`grep_repo` calls it wants as JSON, and Mira runs them itself.
+The official Mira image installs the newest Claude Code CLI on every build and
+logs its version at startup. Each call runs `claude -p` in an empty temporary
+directory with a minimal environment — only the subscription token is passed,
+never `ANTHROPIC_API_KEY` or Mira's service credentials — and with no tools,
+MCP servers, hooks, settings or slash commands. Agentic review hops still run
+on it: the model names the `read_file`/`grep_repo` calls it wants as JSON, and
+Mira runs them itself. One agentic loop is one resumed CLI session kept in a
+private temporary directory until the loop ends, so later hops send only new
+tool results; every other call saves no session.
 Provider choice, the token variable, and all failover settings are
 deployment-only, as are `base_url` and `api_key_env`: repository
 `.mira.yaml` files cannot set them. Automated use draws on the subscription's
