@@ -165,6 +165,18 @@ class TestReviewEngine:
         mock_provider.post_review.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_review_pr_reports_head_sha(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """The result carries the head SHA from the PR info the engine already fetched."""
+        mock_provider.get_pr_info.return_value.head_sha = "abc123"
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result.head_sha == "abc123"
+        mock_provider.get_pr_info.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_walkthrough_retries_corrupted_response(
         self, mock_provider: AsyncMock, sample_diff_text: str
     ):

@@ -92,7 +92,25 @@ def review_completed_payload(repo_full: str, pr_url: str, number: int, result: A
         # 0-comment review isn't mistaken for a clean one.
         "failed_chunks": len(failed),
         "failed_chunk_list": failed,
+        # Head commit the review ran against; "" when unknown.
+        "head_sha": getattr(result, "head_sha", "") or "",
     }
+
+
+async def emit_review_events(repo_full: str, pr_url: str, number: int, result: Any) -> None:
+    """Send ``review.completed``, plus ``review.high_severity`` when any finding
+    is WARNING or above, for a finished review.
+
+    Every path that runs a review (new PR, push, ``review`` and ``review-rest``
+    commands) goes through here so the outbound events can't drift apart.
+    """
+    from mira.models import Severity, build_review_stats
+    from mira.outbound_webhooks import REVIEW_COMPLETED, REVIEW_HIGH_SEVERITY, dispatch_event
+
+    event_data = review_completed_payload(repo_full, pr_url, number, result)
+    await dispatch_event(REVIEW_COMPLETED, event_data)
+    if any(sev >= Severity.WARNING for sev in build_review_stats(result.comments)):
+        await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)
 
 
 async def run_pr_review(
@@ -161,18 +179,7 @@ async def run_pr_review(
 
     logger.info("Review complete for %s", pr_url)
 
-    from mira.models import Severity, build_review_stats
-    from mira.outbound_webhooks import (
-        REVIEW_COMPLETED,
-        REVIEW_HIGH_SEVERITY,
-        dispatch_event,
-    )
-
-    stats = build_review_stats(result.comments)
-    event_data = review_completed_payload(repo_full, pr_url, number, result)
-    await dispatch_event(REVIEW_COMPLETED, event_data)
-    if any(sev >= Severity.WARNING for sev in stats):
-        await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)
+    await emit_review_events(repo_full, pr_url, number, result)
 
 
 async def run_pr_command(
@@ -239,11 +246,12 @@ async def run_pr_command(
             "review-rest on %s by @%s — %d file(s)", pr_url, actor, len(progress.skipped_paths)
         )
         try:
-            await engine.review_pr(pr_url)
+            result = await engine.review_pr(pr_url)
             review_tracker.complete(repo_full, number)
         except Exception as exc:
             review_tracker.fail(repo_full, number, str(exc))
             raise
+        await emit_review_events(repo_full, pr_url, number, result)
     elif is_review:
         engine = ReviewEngine(
             config=config,
@@ -258,11 +266,12 @@ async def run_pr_command(
             return
         logger.info("Re-review triggered for %s by @%s", pr_url, actor)
         try:
-            await engine.review_pr(pr_url)
+            result = await engine.review_pr(pr_url)
             review_tracker.complete(repo_full, number)
         except Exception as exc:
             review_tracker.fail(repo_full, number, str(exc))
             raise
+        await emit_review_events(repo_full, pr_url, number, result)
     else:
         pr_info = await provider.get_pr_info(pr_url)
         diff_text = await provider.get_pr_diff(pr_info)

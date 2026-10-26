@@ -544,3 +544,178 @@ async def test_handle_pause_exception_logged_not_raised(
         await handle_pause_resume(_make_pause_comment_payload(), mock_app_auth, "mira-bot", "pause")
 
     assert "boom" in caplog.text
+
+
+# ── review.completed from @-mention re-reviews ──────────────────────────────
+
+
+async def _run_command(
+    command: str,
+    result: ReviewResult | Exception,
+    *,
+    skipped_paths: list[str] | None = None,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Drive the shared ``run_pr_command`` (used by GitHub, GitLab, Forgejo and
+    Origin) with a mocked engine; return (engine, dispatch_event mock)."""
+    from mira.platforms.handlers import run_pr_command
+
+    engine = AsyncMock()
+    if isinstance(result, Exception):
+        engine.review_pr = AsyncMock(side_effect=result)
+    else:
+        engine.review_pr = AsyncMock(return_value=result)
+
+    with (
+        patch("mira.platforms.handlers.ReviewEngine", return_value=engine),
+        patch("mira.platforms.handlers.create_llm"),
+        patch("mira.platforms.handlers.load_config", return_value=MagicMock()),
+        patch("mira.dashboard.api._app_db") as mock_db,
+        patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock) as dispatch,
+    ):
+        mock_db.get_pr_review_progress.return_value = (
+            MagicMock(skipped_paths=skipped_paths) if skipped_paths else None
+        )
+        await run_pr_command(
+            AsyncMock(),
+            "testowner",
+            "testrepo",
+            7,
+            "https://github.com/testowner/testrepo/pull/7",
+            command,
+            "alice",
+            "mira-bot",
+        )
+    return engine, dispatch
+
+
+@pytest.mark.parametrize("command", ["review", "review this pr"])
+async def test_review_command_fires_review_completed(command: str) -> None:
+    result = ReviewResult(
+        summary="ok", comments=[_comment(Severity.SUGGESTION)], head_sha="deadbeef"
+    )
+    engine, dispatch = await _run_command(command, result)
+
+    engine.review_pr.assert_awaited_once()
+    assert _events(dispatch) == ["review.completed"]
+    data = _data_for(dispatch, "review.completed")
+    assert data["repo"] == "testowner/testrepo"
+    assert data["number"] == 7
+    assert data["comments"] == 1
+    assert data["head_sha"] == "deadbeef"
+
+
+async def test_review_rest_command_fires_review_completed() -> None:
+    result = ReviewResult(summary="ok", head_sha="cafe01")
+    engine, dispatch = await _run_command("review-rest", result, skipped_paths=["a.py", "b.py"])
+
+    engine.review_pr.assert_awaited_once()
+    assert _events(dispatch) == ["review.completed"]
+    assert _data_for(dispatch, "review.completed")["head_sha"] == "cafe01"
+
+
+async def test_review_rest_with_nothing_left_sends_nothing() -> None:
+    engine, dispatch = await _run_command("review-rest", ReviewResult(summary="ok"))
+
+    engine.review_pr.assert_not_awaited()
+    assert _events(dispatch) == []
+
+
+@pytest.mark.parametrize(
+    ("severity", "high"),
+    [
+        (Severity.BLOCKER, True),
+        (Severity.WARNING, True),
+        (Severity.SUGGESTION, False),
+        (Severity.NITPICK, False),
+    ],
+)
+async def test_review_command_high_severity_threshold(severity: Severity, high: bool) -> None:
+    result = ReviewResult(summary="s", comments=[_comment(severity)])
+    _, dispatch = await _run_command("review", result)
+
+    events = _events(dispatch)
+    assert "review.completed" in events
+    assert ("review.high_severity" in events) is high
+
+
+async def test_review_command_failure_sends_no_completed() -> None:
+    with pytest.raises(RuntimeError):
+        await _run_command("review", RuntimeError("boom"))
+
+
+async def test_question_command_sends_no_review_events() -> None:
+    from mira.platforms.handlers import run_pr_command
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value="answer")
+    provider = AsyncMock()
+    provider.get_pr_info.return_value = MagicMock(title="t", description="d")
+    provider.get_pr_diff.return_value = ""
+    with (
+        patch("mira.platforms.handlers.create_llm", return_value=llm),
+        patch("mira.platforms.handlers.load_config", return_value=MagicMock()),
+        patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock) as dispatch,
+    ):
+        await run_pr_command(provider, "o", "r", 7, "u", "why is this here?", "alice", "mira-bot")
+    assert _events(dispatch) == []
+
+
+@patch("mira.platforms.handlers.ReviewEngine")
+@patch("mira.platforms.github.webhook.create_provider")
+@patch("mira.platforms.handlers.create_llm")
+@patch("mira.platforms.handlers.load_config")
+async def test_github_review_comment_fires_review_completed(
+    mock_config: MagicMock,
+    mock_llm_cls: MagicMock,
+    mock_provider_cls: MagicMock,
+    mock_engine_cls: MagicMock,
+    mock_app_auth: AsyncMock,
+) -> None:
+    """End to end through the GitHub comment webhook: '@mira-bot review' emits."""
+    mock_config.return_value = MagicMock()
+    mock_engine = AsyncMock()
+    mock_engine.review_pr = AsyncMock(
+        return_value=ReviewResult(summary="ok", comments=[_comment(Severity.WARNING)])
+    )
+    mock_engine_cls.return_value = mock_engine
+
+    with (
+        patch("mira.dashboard.api._app_db"),
+        patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock) as dispatch,
+    ):
+        await handle_comment(_make_comment_payload("@mira-bot review"), mock_app_auth, "mira-bot")
+
+    assert _events(dispatch) == ["review.completed", "review.high_severity"]
+    assert _data_for(dispatch, "review.completed")["number"] == 7
+
+
+@patch("mira.platforms.handlers.ReviewEngine")
+@patch("mira.platforms.github.webhook.create_provider")
+@patch("mira.platforms.handlers.create_llm")
+@patch("mira.platforms.handlers.load_config")
+async def test_new_pr_review_payload_unchanged_plus_head_sha(
+    mock_config: MagicMock,
+    mock_llm_cls: MagicMock,
+    mock_provider_cls: MagicMock,
+    mock_engine_cls: MagicMock,
+    mock_app_auth: AsyncMock,
+) -> None:
+    """New-PR/push reviews still fire exactly once, with the same keys plus head_sha."""
+    mock_config.return_value = MagicMock()
+    result = ReviewResult(summary="ok", comments=[_comment(Severity.WARNING)], head_sha="f00d")
+    dispatch = await _run_pr_handler(result, mock_engine_cls, mock_app_auth)
+
+    assert _events(dispatch) == ["review.completed", "review.high_severity"]
+    data = _data_for(dispatch, "review.completed")
+    assert {
+        "repo",
+        "pr_url",
+        "number",
+        "comments",
+        "key_issues",
+        "severities",
+        "failed_chunks",
+        "failed_chunk_list",
+    } <= set(data)
+    assert data["head_sha"] == "f00d"
+    assert _data_for(dispatch, "review.high_severity") is data
