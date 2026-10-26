@@ -1047,6 +1047,7 @@ class ReviewEngine:
             except Exception as exc:
                 logger.debug("Failed to record last reviewed SHA: %s", exc)
 
+        result.head_sha = pr_info.head_sha or ""
         return result
 
     async def review_diff(self, diff_text: str) -> ReviewResult:

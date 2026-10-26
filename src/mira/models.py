@@ -417,6 +417,8 @@ class ReviewResult:
     # [{"chunk": 1-based index, "files": [...], "error": "..."}].
     failed_chunks: list[dict] = field(default_factory=list)
     total_chunks: int = 0
+    # Head commit the review ran against (from the PR info the engine fetched).
+    head_sha: str = ""
 
 
 def failed_chunks_note(failed_chunks: list[dict], total_chunks: int) -> str:
