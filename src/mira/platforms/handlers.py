@@ -86,6 +86,7 @@ def review_completed_payload(repo_full: str, pr_url: str, number: int, result: A
 
     stats = build_review_stats(result.comments)
     failed = list(getattr(result, "failed_chunks", None) or [])
+    score = getattr(result, "confidence_score", None)
     return {
         "repo": repo_full,
         "pr_url": pr_url,
@@ -97,8 +98,11 @@ def review_completed_payload(repo_full: str, pr_url: str, number: int, result: A
         # 0-comment review isn't mistaken for a clean one.
         "failed_chunks": len(failed),
         "failed_chunk_list": failed,
-        # Head commit the review ran against; "" when unknown.
+        # Head commit the review ran against (the PR head fetched at review
+        # start); "" when unknown.
         "head_sha": getattr(result, "head_sha", "") or "",
+        # Final 1-5 confidence score for that head; None when not scored.
+        "confidence_score": score if isinstance(score, int) else None,
     }
 
 
