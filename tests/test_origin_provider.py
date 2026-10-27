@@ -165,3 +165,62 @@ async def test_get_installation_token_force_bypasses_cache(
     assert first == cached == "oit_1"
     assert forced == "oit_2"
     assert len(mints) == 2
+
+
+# ── command authorization: collaborator permission lookup ───────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (200, {"permission": "admin"}, "write"),
+        (200, {"permission": "write"}, "write"),
+        (200, {"permission": "read"}, "read"),
+        (200, {"permission": "custom"}, "read"),
+        (404, {"code": 5}, "none"),
+    ],
+)
+async def test_get_repo_permission_normalizes(
+    monkeypatch: pytest.MonkeyPatch, status: int, body: dict, expected: str
+) -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(status, json=body)
+
+    monkeypatch.setattr(origin_provider.httpx, "AsyncClient", _mock_transport_client(handler))
+    provider = OriginProvider("tok")
+
+    perm = await provider.get_repo_permission("acme", "rocket", "alice", user_id="user_abc")
+
+    assert perm == expected
+    assert seen == ["/v1/origin/repos/acme/rocket/collaborators/user_abc/permission"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", [None, 42, "app_123"])
+async def test_get_repo_permission_without_user_id_is_undetermined(
+    monkeypatch: pytest.MonkeyPatch, user_id: Any
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no lookup without a user_… id")
+
+    monkeypatch.setattr(origin_provider.httpx, "AsyncClient", _mock_transport_client(handler))
+    provider = OriginProvider("tok")
+
+    assert await provider.get_repo_permission("acme", "rocket", "alice", user_id=user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_repo_permission_missing_scope_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without repository:members:read the lookup fails; command_policy fails closed.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"code": 7})
+
+    monkeypatch.setattr(origin_provider.httpx, "AsyncClient", _mock_transport_client(handler))
+    provider = OriginProvider("tok")
+
+    with pytest.raises(ProviderError):
+        await provider.get_repo_permission("acme", "rocket", "alice", user_id="user_abc")

@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from mira.config import load_config
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
+from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.mentions import (
     author_is_filtered,
@@ -167,6 +168,13 @@ def _actor_handle(actor: dict[str, Any] | None) -> str:
     if app.get("id"):
         return str(app["id"])
     return ""
+
+
+def _actor_user_id(actor: dict[str, Any] | None) -> str | None:
+    """The ``user_…`` id of a human actor, used for permission lookups."""
+    user = (actor or {}).get("user") or {}
+    uid = user.get("id")
+    return str(uid) if uid else None
 
 
 def _repo_owner_name(repo: dict[str, Any]) -> tuple[str, str] | None:
@@ -437,6 +445,7 @@ async def handle_origin_comment(
     pr_url = _pr_web_url(owner, repo_name, number, pr)
 
     actor = _actor_handle(comment.get("author"))
+    actor_id = _actor_user_id(comment.get("author"))
     thread = comment.get("thread") or {}
     comment_path = thread.get("path") or ""
     comment_line = int(thread.get("startLine") or thread.get("endLine") or 0)
@@ -452,8 +461,22 @@ async def handle_origin_comment(
         names = mention_names(bot_name, await auth.get_bot_identity())
         question = strip_mentions(comment_body, names)
         first_word = question.split()[0].lower() if question.split() else ""
+        config = load_config()
+
+        async def _allowed(command: str) -> bool:
+            return await is_command_allowed(
+                config,
+                command,
+                actor,
+                provider=provider,
+                owner=owner,
+                repo=repo_name,
+                user_id=actor_id,
+            )
 
         if first_word in _PAUSE_KEYWORDS:
+            if not await _allowed("pause"):
+                return
             await provider.add_label(pr_info, PAUSE_LABEL)
             await provider.post_comment(
                 pr_info,
@@ -461,11 +484,15 @@ async def handle_origin_comment(
             )
             return
         if first_word in _RESUME_KEYWORDS:
+            if not await _allowed("resume"):
+                return
             await provider.remove_label(pr_info, PAUSE_LABEL)
             await provider.post_comment(pr_info, "Automatic reviews resumed.")
             return
 
         if first_word in _REJECT_KEYWORDS and comment_path:
+            if not await _allowed("reject"):
+                return
             try:
                 store = _open_store(owner, repo_name, "origin")
                 store.record_feedback(
@@ -503,6 +530,7 @@ async def handle_origin_comment(
                 actor=actor,
                 bot_name=bot_name,
                 platform="origin",
+                user_id=actor_id,
             )
             return
 
@@ -516,6 +544,7 @@ async def handle_origin_comment(
             actor,
             bot_name,
             platform="origin",
+            user_id=actor_id,
         )
     except Exception:
         logger.exception(

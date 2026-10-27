@@ -52,7 +52,7 @@ async def is_command_allowed(
     provider: BaseProvider,
     owner: str,
     repo: str,
-    user_id: int | None = None,
+    user_id: int | str | None = None,
 ) -> bool:
     """Whether ``actor`` may run ``command`` on ``owner/repo``."""
     if command not in COMMANDS:

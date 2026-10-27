@@ -104,7 +104,7 @@ class BaseProvider(abc.ABC):
         repo: str,
         username: str,
         *,
-        user_id: int | None = None,
+        user_id: int | str | None = None,
     ) -> str | None:
         """Normalized repo permission for a user.
 
