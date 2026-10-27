@@ -20,23 +20,32 @@ def mention_names(bot_name: str, bot_identity: str | None) -> list[str]:
     return names
 
 
+def _mention_re(name: str) -> str:
+    # The handle must end at a non-handle character, so "@mira" doesn't match
+    # the front of "@mira-pm" and leave "-pm review" behind.
+    return rf"@{re.escape(name)}(?![\w-])"
+
+
+def _longest_first(names: list[str]) -> list[str]:
+    return sorted(names, key=len, reverse=True)
+
+
 def has_mention(text: str, names: list[str]) -> bool:
-    low = text.lower()
-    return any(f"@{n.lower()}" in low for n in names)
+    return any(re.search(_mention_re(n), text, re.IGNORECASE) for n in names)
 
 
 def strip_mentions(text: str, names: list[str]) -> str:
     out = text
-    for n in names:
-        out = re.sub(rf"@{re.escape(n)}\s*", "", out, flags=re.IGNORECASE)
+    for n in _longest_first(names):
+        out = re.sub(rf"{_mention_re(n)}\s*", "", out, flags=re.IGNORECASE)
     return out.strip()
 
 
 def command_after_mention(text: str, names: list[str]) -> str:
     """The first word following ``@<name>`` for any matched name (lowercased),
     or "" — e.g. "@mira review" → "review"."""
-    for n in names:
-        m = re.search(rf"@{re.escape(n)}\s+(\w+)", text, re.IGNORECASE)
+    for n in _longest_first(names):
+        m = re.search(rf"{_mention_re(n)}\s+(\w+)", text, re.IGNORECASE)
         if m:
             return m.group(1).lower()
     return ""

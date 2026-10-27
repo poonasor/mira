@@ -65,3 +65,17 @@ def test_author_is_filtered_blocked_preempts_allowlist():
 
 def test_author_is_filtered_empty_login_not_filtered():
     assert author_is_filtered("", ["alice"], []) is False
+
+
+def test_configured_name_that_prefixes_the_app_slug():
+    """bot_name "mira" + GitHub App slug "mira-pm": "@mira-pm review" must be
+    the review command, not a Q&A about "-pm review"."""
+    names = mention_names("mira", "mira-pm")
+    assert strip_mentions("@mira-pm review", names) == "review"
+    assert command_after_mention("@mira-pm review", names) == "review"
+    assert strip_mentions("@mira review", names) == "review"
+    assert strip_mentions("@mira, can you @mira-pm review", names) == ", can you review"
+    assert has_mention("@mira-pm review", names)
+    assert has_mention("@mira review", names)
+    assert not has_mention("@mirabelle review", names)
+    assert not has_mention("@mira-pmx review", names)
