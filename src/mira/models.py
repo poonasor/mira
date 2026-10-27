@@ -216,8 +216,14 @@ class WalkthroughResult:
         failure_notice: str | None = None,
         failed_chunks: list[dict] | None = None,
         total_chunks: int = 0,
+        head_sha: str = "",
+        head_sha_url: str = "",
     ) -> str:
-        """Render as a markdown PR comment."""
+        """Render as a markdown PR comment.
+
+        ``head_sha`` (with optional ``head_sha_url``) names the commit the
+        confidence score was given for, shown next to the score.
+        """
         parts = [WALKTHROUGH_MARKER, "## Mira PR Walkthrough", ""]
         parts.append(self.summary)
 
@@ -242,10 +248,16 @@ class WalkthroughResult:
             filled = "\u25c9" * score  # ◉
             empty = "\u25cb" * (5 - score)  # ○
             label = cs.label if cs.label else ""
+            head_note = ""
+            if head_sha:
+                short = f"<code>{head_sha[:7]}</code>"
+                ref = f'<a href="{head_sha_url}">{short}</a>' if head_sha_url else short
+                head_note = f" &nbsp; \u00b7 &nbsp; head {ref}"
             parts.append("")
             parts.append(
                 f"<details>\n"
-                f"<summary><b>Confidence: {score}/5</b> &nbsp; {filled}{empty} &nbsp; {label}</summary>\n"
+                f"<summary><b>Confidence: {score}/5</b> &nbsp; {filled}{empty} &nbsp; {label}"
+                f"{head_note}</summary>\n"
             )
             if cs.reason:
                 parts.append(f"- {cs.reason}")
@@ -419,6 +431,34 @@ class ReviewResult:
     total_chunks: int = 0
     # Head commit the review ran against (from the PR info the engine fetched).
     head_sha: str = ""
+
+    @property
+    def confidence_score(self) -> int | None:
+        """The final 1-5 confidence score, or None when no walkthrough scored it."""
+        cs = self.walkthrough.confidence_score if self.walkthrough else None
+        return cs.score if cs else None
+
+
+def score_line(score: int | None, head_sha: str) -> str:
+    """Human-readable score line pinned to the reviewed head, e.g.
+    ``Confidence: 4/5 · head <full sha>``."""
+    shown = f"{score}/5" if score is not None else "n/a"
+    return f"Confidence: {shown} \u00b7 head {head_sha}"
+
+
+def score_marker(score: int | None, head_sha: str) -> str:
+    """Machine-readable score marker, e.g. ``<!-- mira-score sha=<sha> score=4 -->``.
+
+    Merge gates match this against the PR's current head SHA, so the score is
+    only trusted for the exact commit it was given for.
+    """
+    shown = str(score) if score is not None else "none"
+    return f"<!-- mira-score sha={head_sha} score={shown} -->"
+
+
+def score_block(score: int | None, head_sha: str) -> str:
+    """Score line plus marker, appended to the formal review body."""
+    return f"{score_line(score, head_sha)}\n{score_marker(score, head_sha)}"
 
 
 def failed_chunks_note(failed_chunks: list[dict], total_chunks: int) -> str:

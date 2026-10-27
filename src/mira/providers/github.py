@@ -25,6 +25,7 @@ from mira.models import (
     ReviewComment,
     ReviewResult,
     UnresolvedThread,
+    score_block,
 )
 from mira.providers.base import BaseProvider
 
@@ -477,7 +478,9 @@ class GitHubProvider(BaseProvider):
         result: ReviewResult,
         bot_name: str = "miracodeai",
     ) -> list[int]:
-        if not result.comments:
+        # A zero-finding run still submits a review when it can pin a score to
+        # the reviewed head; with nothing to pin there is nothing to post.
+        if not result.comments and not result.head_sha:
             return []
 
         # The line GitHub anchors a comment to (the end line for multi-line).
@@ -504,6 +507,11 @@ class GitHubProvider(BaseProvider):
             review_body = f"**Mira Review Summary**\n\n{result.summary}"
         if result.key_issues:
             review_body += _format_key_issues(result.key_issues)
+        if not result.comments and not review_body:
+            review_body = "**Mira Review** \u2014 no issues found."
+        if result.head_sha:
+            score = score_block(result.confidence_score, result.head_sha)
+            review_body = f"{review_body}\n\n{score}" if review_body else score
 
         token = await self._resolve_token()
         gh = self._make_client(token)
@@ -513,10 +521,15 @@ class GitHubProvider(BaseProvider):
             gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             pr = gh_repo.get_pull(pr_info.number)
 
-            commits = list(pr.get_commits())
-            if not commits:
-                raise ProviderError("PR has no commits")
-            latest_commit = commits[-1]
+            # Pin to the head the review actually ran against, not whatever the
+            # PR's head is by the time we post (a push may have landed since).
+            if result.head_sha:
+                latest_commit = gh_repo.get_commit(result.head_sha)
+            else:
+                commits = list(pr.get_commits())
+                if not commits:
+                    raise ProviderError("PR has no commits")
+                latest_commit = commits[-1]
 
             # GitHub comment IDs aligned to result.comments (0 = unknown).
             ids = [0] * len(result.comments)
@@ -586,8 +599,9 @@ class GitHubProvider(BaseProvider):
                     else:
                         raise
 
-            # If every inline failed, post the summary alone so the review still shows up.
-            if posted == 0 and review_body:
+            # If every inline failed, post the summary alone so the review still
+            # shows up. A pinned score always needs its formal review.
+            if (posted == 0 or result.head_sha) and review_body:
                 try:
                     pr.create_review(
                         commit=latest_commit,

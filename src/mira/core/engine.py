@@ -69,6 +69,19 @@ from mira.security.secrets_scan import scan_secrets
 logger = logging.getLogger(__name__)
 
 
+def commit_web_url(pr_info: PRInfo, sha: str) -> str:
+    """Web link to ``sha`` within the PR, or "" when the platform's URL shape is unknown."""
+    if not sha or not pr_info.url:
+        return ""
+    base = pr_info.url.rstrip("/")
+    platform = (pr_info.platform or "github").lower()
+    if platform in ("github", "forgejo"):
+        return f"{base}/commits/{sha}"
+    if platform == "gitlab":
+        return f"{base}/diffs?commit_id={sha}"
+    return ""
+
+
 def _audit_drop(c: ReviewComment, stage: str, reason: str = "") -> dict:
     """Audit entry for a comment removed by a pipeline stage."""
     return {
@@ -555,6 +568,15 @@ class ReviewEngine:
 
         pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
+        # The SHA fetched here is the one the whole run reviews, scores, and
+        # pins its formal review to — never a later re-read of the PR head.
+        logger.info(
+            "Reviewing %s/%s#%d at head %s",
+            pr_info.owner,
+            pr_info.repo,
+            pr_info.number,
+            pr_info.head_sha or "unknown",
+        )
 
         async def _resolve_threads() -> tuple[
             int, int, list[UnresolvedThread], list[ThreadDecision]
@@ -767,6 +789,8 @@ class ReviewEngine:
 
             raise
 
+        result.head_sha = pr_info.head_sha or ""
+
         # The final walkthrough must land after the in-progress one, or it gets
         # overwritten on fast PRs and stays stuck on "in progress".
         notify_task = getattr(self, "_walkthrough_notify_task", None)
@@ -871,6 +895,8 @@ class ReviewEngine:
                         overlaps=overlaps or None,
                         failed_chunks=result.failed_chunks or None,
                         total_chunks=result.total_chunks,
+                        head_sha=pr_info.head_sha or "",
+                        head_sha_url=commit_web_url(pr_info, pr_info.head_sha or ""),
                     )
                     comment_id = placeholder_id
                     if comment_id is None:
@@ -919,20 +945,30 @@ class ReviewEngine:
             llm_resolved,
         )
 
+        # One formal review per run. With findings it carries the inline
+        # comments; with none it still goes out (when the run produced a score
+        # for a known head) so merge gates get a score pinned to that SHA.
         posted_comment_ids: list[int] = []
-        if result.comments:
+        scored = bool(result.head_sha) and result.confidence_score is not None
+        if not result.comments:
+            logger.info("No code suggestions for PR %s", pr_info.url)
+        if result.comments or scored:
             if self.dry_run:
                 logger.info(
-                    "Dry run: would post %d comment(s) on PR %s",
+                    "Dry run: would post a review with %d comment(s) on PR %s",
                     len(result.comments),
                     pr_info.url,
                 )
-            else:
+            elif result.comments:
                 posted_comment_ids = (
                     await self.provider.post_review(pr_info, result, bot_name=self.bot_name) or []
                 )
-        else:
-            logger.info("No code suggestions for PR %s", pr_info.url)
+            else:
+                # A score-only review failing shouldn't fail an otherwise clean run.
+                try:
+                    await self.provider.post_review(pr_info, result, bot_name=self.bot_name)
+                except Exception as exc:
+                    logger.warning("Failed to post scored review for PR %s: %s", pr_info.url, exc)
 
         result.thread_decisions = thread_decisions
 
@@ -1047,7 +1083,6 @@ class ReviewEngine:
             except Exception as exc:
                 logger.debug("Failed to record last reviewed SHA: %s", exc)
 
-        result.head_sha = pr_info.head_sha or ""
         return result
 
     async def review_diff(self, diff_text: str) -> ReviewResult:

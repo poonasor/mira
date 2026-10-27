@@ -29,6 +29,7 @@ from mira.models import (
     PRInfo,
     ReviewResult,
     UnresolvedThread,
+    score_block,
 )
 from mira.platforms import profiles
 from mira.providers.base import BaseProvider
@@ -310,7 +311,10 @@ class ForgejoProvider(BaseProvider):
     async def post_review(
         self, pr_info: PRInfo, result: ReviewResult, bot_name: str = "miracodeai"
     ) -> None:
-        if not result.comments:
+        # A zero-finding run still submits a review when it can pin a score to
+        # the reviewed head; with nothing to pin there is nothing to post.
+        head_sha = result.head_sha or pr_info.head_sha
+        if not result.comments and not result.head_sha:
             return
 
         summary_text = ""
@@ -318,11 +322,16 @@ class ForgejoProvider(BaseProvider):
             summary_text = f"**Mira Review Summary**\n\n{result.summary}"
         if result.key_issues:
             summary_text += format_key_issues(result.key_issues)
+        if not result.comments and not summary_text:
+            summary_text = "**Mira Review** \u2014 no issues found."
+        if result.head_sha:
+            score = score_block(result.confidence_score, result.head_sha)
+            summary_text = f"{summary_text}\n\n{score}" if summary_text else score
 
         review_body = {
             "event": "COMMENT",
             "body": summary_text or None,
-            "commit_id": pr_info.head_sha,
+            "commit_id": head_sha,
             "comments": [
                 {
                     "path": comment.path,
