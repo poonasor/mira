@@ -304,7 +304,8 @@ def get_timeseries(period: str = "day") -> list[TimeSeriesPoint]:
         if period == "month":
             key = dt.strftime("%Y-%m")
         elif period == "week":
-            key = dt.strftime("%Y-W%W")
+            iso_year, iso_week, _ = dt.isocalendar()
+            key = f"{iso_year}-W{iso_week:02d}"
         else:
             key = dt.strftime("%Y-%m-%d")
 

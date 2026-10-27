@@ -22,6 +22,7 @@ from mira.providers.github import (
     GitHubProvider,
     _async_constant,
     _format_comment_body,
+    _normalize_permission,
     parse_pr_url,
 )
 
@@ -65,6 +66,49 @@ class TestGitHubProvider:
     def test_requires_token(self):
         with pytest.raises(ProviderError, match="token is required"):
             GitHubProvider(token="")
+
+
+class TestGetRepoPermission:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw", "normalized"),
+        [
+            ("admin", "write"),
+            ("maintain", "write"),
+            ("push", "write"),
+            ("write", "write"),
+            ("triage", "read"),
+            ("pull", "read"),
+            ("read", "read"),
+            ("none", "none"),
+            ("unexpected", None),
+        ],
+    )
+    async def test_normalizes_permission_levels(self, raw, normalized):
+        assert _normalize_permission(raw) == normalized
+
+    @pytest.mark.asyncio
+    async def test_fetches_collaborator_permission(self):
+        provider = GitHubProvider("token")
+        repo = MagicMock()
+        repo.get_collaborator_permission.return_value = "admin"
+        provider._make_client = MagicMock(
+            return_value=MagicMock(get_repo=MagicMock(return_value=repo))
+        )
+
+        assert await provider.get_repo_permission("o", "r", "alice") == "write"
+        repo.get_collaborator_permission.assert_called_once_with("alice")
+
+    @pytest.mark.asyncio
+    async def test_missing_collaborator_is_none(self):
+        provider = GitHubProvider("token")
+        repo = MagicMock()
+        repo.get_collaborator_permission.side_effect = GithubException(404, {}, {})
+        provider._make_client = MagicMock(
+            return_value=MagicMock(get_repo=MagicMock(return_value=repo))
+        )
+
+        assert await provider.get_repo_permission("o", "r", "alice") == "none"
 
 
 def _make_pr_info() -> PRInfo:
@@ -1691,3 +1735,74 @@ class TestEnterpriseAPIURL:
             assert mod._GITHUB_API_URL == "https://api.github.com"
             gh = mod.GitHubProvider("tok")._make_client("tok")
             assert gh.requester.base_url == "https://api.github.com"
+
+
+class TestPRDescription:
+    """get_pr_description/update_pr_description must build the client like every
+    other method does (_resolve_token + _make_client). Using a non-existent
+    self._github made both fail with "Failed to fetch PR description:
+    'GitHubProvider' object has no attribute '_github'", which is what broke
+    review.pr_summary on GitHub."""
+
+    @pytest.mark.asyncio
+    async def test_get_pr_description_uses_a_client(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+
+        mock_pr = MagicMock()
+        mock_pr.body = "the description"
+        mock_repo = MagicMock()
+        mock_repo.get_pull.return_value = mock_pr
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        with patch("mira.providers.github.Github", return_value=mock_gh):
+            body = await provider.get_pr_description(_make_pr_info())
+
+        assert body == "the description"
+        mock_gh.get_repo.assert_called_once_with("o/r")
+
+    @pytest.mark.asyncio
+    async def test_get_pr_description_empty_body_is_empty_string(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+
+        mock_pr = MagicMock()
+        mock_pr.body = None
+        mock_repo = MagicMock()
+        mock_repo.get_pull.return_value = mock_pr
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        with patch("mira.providers.github.Github", return_value=mock_gh):
+            assert await provider.get_pr_description(_make_pr_info()) == ""
+
+    @pytest.mark.asyncio
+    async def test_update_pr_description_uses_a_client(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+
+        mock_pr = MagicMock()
+        mock_repo = MagicMock()
+        mock_repo.get_pull.return_value = mock_pr
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        with patch("mira.providers.github.Github", return_value=mock_gh):
+            await provider.update_pr_description(_make_pr_info(), "new body")
+
+        mock_pr.edit.assert_called_once_with(body="new body")
+
+    @pytest.mark.asyncio
+    async def test_get_pr_description_failure_is_a_provider_error(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+
+        mock_gh = MagicMock()
+        mock_gh.get_repo.side_effect = GithubException(404, "not found", None)
+
+        with (
+            patch("mira.providers.github.Github", return_value=mock_gh),
+            pytest.raises(ProviderError, match="Failed to fetch PR description"),
+        ):
+            await provider.get_pr_description(_make_pr_info())

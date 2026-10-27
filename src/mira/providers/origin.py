@@ -249,6 +249,35 @@ class OriginProvider(BaseProvider):
                 self._identity = ""
         return self._identity or ""
 
+    async def get_repo_permission(
+        self,
+        owner: str,
+        repo: str,
+        username: str,
+        *,
+        user_id: int | str | None = None,
+    ) -> str | None:
+        """Collaborator permission for a ``user_…`` id, normalized for authz.
+
+        Origin looks permissions up by public user id, not handle, and needs
+        the ``repository:members:read`` scope. Without an id there is nothing
+        to look up (``None``, which command authorization treats as a denial).
+        A 404 covers no access, unknown users and mirrored repos alike.
+        """
+        if not isinstance(user_id, str) or not user_id.startswith("user_"):
+            return None
+        url = f"{self._repo(owner, repo)}/collaborators/{quote(user_id, safe='')}/permission"
+        resp = await self._request("GET", url, ok=(200, 404))
+        if resp.status_code == 404:
+            return "none"
+        permission = str((resp.json() or {}).get("permission") or "").lower()
+        if permission in {"admin", "write"}:
+            return "write"
+        if permission in {"read", "custom"}:
+            # ``custom`` grants are opaque; fail closed and treat them as read.
+            return "read"
+        return "none"
+
     # ── PR read ─────────────────────────────────────────────────────
 
     async def get_pr_info(self, pr_url: str) -> PRInfo:
