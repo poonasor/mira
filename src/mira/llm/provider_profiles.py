@@ -38,6 +38,9 @@ DEFAULT_PROFILE: dict = {
     "reasoning_effort_map": {},
     "reasoning_style": "nested",
     "supports_forced_tool_choice": True,
+    # Sent when reasoning is off, for endpoints that think by default and need
+    # an explicit disable (DeepSeek). Empty for everyone else — no-op.
+    "reasoning_off_payload": {},
     "api_key_env": None,
 }
 

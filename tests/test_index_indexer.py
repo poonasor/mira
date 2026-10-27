@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -11,7 +12,9 @@ from mira.config import MiraConfig
 from mira.index.indexer import (
     _build_file_summary,
     _content_hash,
+    _index_conventions,
     _parse_summarize_response,
+    _read_paths,
     _should_index,
     _strip_code_fences,
     index_diff,
@@ -444,3 +447,72 @@ class TestIndexDiff:
 
         assert store.get_summary("old.py") is None
         store.close()
+
+
+@pytest.mark.asyncio
+class TestReadPaths:
+    """The tarball cache holds indexable paths only, so a miss means "not cached"."""
+
+    async def test_paths_absent_from_the_cache_are_fetched(self):
+        fetcher = _FakeFetcher(contents={"AGENTS.md": "# rules", "go.mod": "module x"})
+
+        resolved = await _read_paths(
+            "o",
+            "r",
+            fetcher,
+            "main",
+            ["AGENTS.md", "go.mod"],
+            asyncio.Semaphore(4),
+            cached_contents={"main.py": "print()"},
+        )
+
+        assert resolved == {"AGENTS.md": "# rules", "go.mod": "module x"}
+
+    async def test_cached_contents_are_not_refetched(self):
+        fetcher = _FakeFetcher(contents={"AGENTS.md": "fetched"})
+
+        resolved = await _read_paths(
+            "o",
+            "r",
+            fetcher,
+            "main",
+            ["AGENTS.md"],
+            asyncio.Semaphore(4),
+            cached_contents={"AGENTS.md": "cached"},
+        )
+
+        assert resolved == {"AGENTS.md": "cached"}
+
+    async def test_a_path_in_neither_resolves_to_none(self):
+        fetcher = _FakeFetcher(contents={})
+
+        resolved = await _read_paths(
+            "o", "r", fetcher, "main", ["STYLE.md"], asyncio.Semaphore(4), cached_contents={}
+        )
+
+        assert resolved == {"STYLE.md": None}
+
+
+@pytest.mark.asyncio
+class TestIndexConventionsCacheMiss:
+    async def test_conventions_load_when_the_tarball_omits_them(self):
+        """`_should_index` rejects AGENTS.md, so it is never in the tarball cache."""
+        fetcher = _FakeFetcher(
+            contents={"AGENTS.md": "# Team rules\n\n- Always flag bare excepts.\n"}
+        )
+
+        with patch("mira.dashboard.api._app_db") as app_db:
+            await _index_conventions(
+                "o",
+                "r",
+                fetcher,
+                "main",
+                ["AGENTS.md", "main.py"],
+                asyncio.Semaphore(4),
+                cached_contents={"main.py": "print()"},
+            )
+
+        app_db.set_repo_conventions.assert_called_once()
+        owner, repo, extracted = app_db.set_repo_conventions.call_args.args
+        assert (owner, repo) == ("o", "r")
+        assert "bare excepts" in extracted

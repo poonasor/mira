@@ -81,6 +81,38 @@ filter:
   # Maximum number of files to review
   max_files: 50
 
+# Who may invoke interactive @-mention commands (review, review-rest, help,
+# pause, resume, reject, and free-form questions). Independent of the
+# auto-review author lists above. Deployment-only: set this in `mira.yaml`,
+# not in a repository's `.mira.yaml`.
+commands:
+  # Extra users allowed to run any command, including read-only users.
+  allowed_users: []
+  # Applies to every command. Users with write/admin access to the repository
+  # may invoke commands. If the bot cannot read collaborator/member roles from
+  # the provider API, commands are denied unless the user is listed in
+  # allowed_users (or a per-command list). Forgejo additionally requires the
+  # bot account to be a repository admin/owner (or site admin) to look up
+  # other users' permissions.
+  allow_repo_write_access: true
+  # Always denied; takes precedence over the grants above.
+  blocked_users: []
+  # Per-command overrides. Setting allowed_users here replaces the global
+  # allowlist for that command only. blocked_users adds command-specific
+  # denials on top of the global list. The write-access gate above still
+  # applies to every command.
+  # review:
+  #   allowed_users:
+  #     - alice
+  # ask:
+  #   blocked_users:
+  #     - alice              # alice can use every command except free-form ask
+  # review_rest: {}
+  # help: {}
+  # pause: {}
+  # resume: {}
+  # reject: {}
+
 review:
   # Lines of context around hunks
   context_lines: 3
