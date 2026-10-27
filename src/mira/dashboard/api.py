@@ -48,7 +48,7 @@ def register_dashboard(app: FastAPI) -> None:
 
 # Standalone app — initialized at module load, but routes are registered at
 # the bottom of this file, *after* all @router decorators have run.
-app = FastAPI(title="Mira Dashboard API", version="0.9.1")
+app = FastAPI(title="Mira Dashboard API", version="0.10.0")
 
 _INDEX_DIR = os.environ.get("MIRA_INDEX_DIR", "/data/indexes")
 
@@ -417,7 +417,7 @@ class GlobalSettingsUpdate(BaseModel):
 
 # Only `filter` and `review` are admin-editable from the UI; LLM creds and
 # DB settings stay env-only and would be silently overwritten if exposed
-# here.
+# here. `commands` is deliberately deployment-config-only (`mira.yaml`).
 _ALLOWED_OVERRIDE_SECTIONS = {"filter", "review"}
 
 
@@ -531,8 +531,16 @@ async def _run_initial_indexing(default_mode: str) -> None:
     from mira.llm import create_llm
     from mira.platforms.fetch import EmptyRepoError, make_fetcher
 
-    config = load_config()
-    llm = create_llm(llm_config_for("indexing", config.llm))
+    try:
+        config = load_config()
+        llm = create_llm(llm_config_for("indexing", config.llm))
+    except Exception as exc:
+        # Runs as a fire-and-forget task: without this, the error is lost and
+        # every repo in the batch stays "indexing" until a restart.
+        logger.exception("Initial indexing setup failed")
+        for r in to_index:
+            _app_db.set_repo_status(r.owner, r.repo, "failed", error=str(exc), platform=r.platform)
+        return
 
     for repo_record in to_index:
         owner, repo, platform = repo_record.owner, repo_record.repo, repo_record.platform

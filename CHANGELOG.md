@@ -4,6 +4,42 @@ All notable changes to Mira are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.10.0] — 2026-10-26
+
+### Security
+
+- **Breaking: comment commands require repository write access by default.** GitHub, GitLab, and Forgejo now check permissions before running `review`, `review-rest`, `help`, `pause`, `resume`, `reject`, or free-form questions. Permission lookup failures deny access. To retain access for read-only users, add them to `commands.allowed_users` or a per-command `commands.<name>.allowed_users` list; `commands.blocked_users` always wins.
+- **Free-form disagreements respect the reject policy.** A reply classified as disagreement resolves the thread and records rejected feedback only when its author can run `reject`; answering the reply also requires `ask` permission.
+- **Malformed outbound webhook URLs are contained.** Invalid URLs are rejected during validation and cannot escape delivery error handling. HTTP redirects and other non-success delivery statuses are reported as failures.
+
+### Added
+
+- **Broader source and configuration file support.** Review and indexing recognize more languages, templates, build files, and configuration formats, while documentation remains excluded from indexing.
+- **Configurable indexing concurrency.** `index.llm_concurrency` controls concurrent LLM summarization batches for full and incremental indexing. The default is 8, with a supported range of 1–32, so deployments can respect provider concurrency limits.
+
+### Fixed
+
+- **Nested GitLab namespaces work throughout the dashboard.** Repository details, setup, rules, learnings, and vulnerability routes accept nested groups, validate repository keys, and render useful breadcrumbs.
+- **GitHub Enterprise uses the configured API URL.** Review and PR-description helpers now build clients against the deployment's configured GitHub endpoint.
+- **Indexing fetches files omitted from tarball caches.** Conventions and package manifests fall back to individual source fetches when the cached archive does not contain them.
+- **Failed initial indexing updates repository status.** Setup failures mark affected repositories as failed instead of leaving them pending indefinitely.
+- **PostgreSQL contributor quality matches SQLite.** Per-author review and feedback quality is available when using the PostgreSQL index store.
+- **Walkthrough parsing accepts capitalized keys.** Capitalized file and change-group keys from model output no longer cause valid walkthrough content to be lost.
+- **Self-critique handles missing verdict indexes.** Positional matching is used only for a complete list of unindexed verdicts, preventing partial results from being assigned to the wrong findings.
+- **JSON output instructions survive provider routing.** Chat Completions and Responses requests keep the required JSON instruction in user input, including when a proxy moves system content into separate instructions.
+- **DeepSeek respects disabled reasoning.** Requests explicitly disable DeepSeek thinking when reasoning is set to `off`.
+- **Codex CLI loads review schemas correctly.** Review schema imports use the shared tool-schema module.
+- **Dependency polling retains distinct npm resolutions.** Multiple installed versions of the same package are preserved during vulnerability polling.
+- **Weekly review metrics use ISO week years.** Reviews around New Year are grouped into the correct ISO week.
+- **React and React DOM stay aligned at 19.3.0.** Matching runtime and type packages prevent the version mismatch that could leave the dashboard blank.
+
+### Changed
+
+- **Clearer review diagnostics.** GitHub webhook filter decisions are logged at INFO level, and LLM failures include transport timing or response-shape details without logging reasoning text.
+- **Dashboard dependencies refreshed.** UI libraries and development tools have been updated, including Vite, ESLint, TypeScript tooling, and formatting utilities.
+
 ## [0.9.1] — 2026-09-23
 
 ### Added
@@ -318,6 +354,7 @@ Initial public release.
 - `handle_push_index` now updates `updated_at` after incremental re-indexing
   so the "Indexed X ago" timestamp tracks reality.
 
+[0.10.0]: https://github.com/miracodeai/mira/releases/tag/v0.10.0
 [0.9.1]: https://github.com/miracodeai/mira/releases/tag/v0.9.1
 [0.6.0]: https://github.com/miracodeai/mira/releases/tag/v0.6.0
 [0.5.1]: https://github.com/miracodeai/mira/releases/tag/v0.5.1

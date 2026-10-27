@@ -284,7 +284,8 @@ async def test_mr_open_allowlist_filters_off_list(client):
 
 
 @pytest.mark.asyncio
-async def test_note_review_bypass_for_blocked_author(client):
+async def test_note_review_ignores_author_filter(client):
+    """Commands use the command policy, not the auto-review author filter."""
     payload = _note_payload(note="@mira-bot review")
     payload["user"]["username"] = "dependabot"
     cfg = MiraConfig(filter=FilterConfig(blocked_authors=["dependabot"]))
@@ -302,7 +303,8 @@ async def test_note_review_bypass_for_blocked_author(client):
 
 
 @pytest.mark.asyncio
-async def test_note_non_review_no_bypass(client):
+async def test_note_non_review_ignores_author_filter(client):
+    """Free-form command dispatch is separate from the auto-review author filter."""
     payload = _note_payload(note="@mira-bot pause")
     payload["user"]["username"] = "alice"
     cfg = MiraConfig(filter=FilterConfig(blocked_authors=["alice"]))
@@ -315,5 +317,5 @@ async def test_note_non_review_no_bypass(client):
             content=json.dumps(payload),
             headers={"X-Gitlab-Token": GL_SECRET, "X-Gitlab-Event": "Note Hook"},
         )
-    assert resp.json()["status"] == "ignored"
-    h.assert_not_called()
+    assert resp.json()["status"] == "processing"
+    h.assert_awaited_once()

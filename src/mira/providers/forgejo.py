@@ -139,6 +139,45 @@ class ForgejoProvider(BaseProvider):
             platform="forgejo",
         )
 
+    async def get_repo_permission(
+        self,
+        owner: str,
+        repo: str,
+        username: str,
+        *,
+        user_id: int | None = None,
+    ) -> str | None:
+        """Fetch a user's collaborator permission, normalized for authz."""
+        url = (
+            f"{self._api}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+            f"/collaborators/{quote(username, safe='')}/permission"
+        )
+        try:
+            resp = await self._request("GET", url, ok=(200, 404))
+        except ProviderError as exc:
+            if getattr(exc, "status_code", None) == 403:
+                raise ProviderError(
+                    f"Forgejo denied the permission lookup for {username!r}. "
+                    "The bot account must be a repository admin/owner (or site "
+                    "admin) to query other users' permissions; otherwise list "
+                    "the user in commands.allowed_users."
+                ) from exc
+            raise
+        except Exception as exc:
+            raise ProviderError(f"Failed to fetch repo permission for {username}: {exc}") from exc
+
+        if resp.status_code == 404:
+            return "none"
+        data = resp.json()
+        permission = str((data or {}).get("permission") or "").lower() if data else ""
+        if permission in ("admin", "owner", "write"):
+            return "write"
+        if permission == "read":
+            return "read"
+        if permission == "none":
+            return "none"
+        return None
+
     async def get_pr_diff(self, pr_info: PRInfo) -> str:
         """Fetch the raw unified diff for the PR."""
         try:

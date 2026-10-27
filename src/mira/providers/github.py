@@ -193,6 +193,21 @@ def _async_constant(value: str) -> Callable[[], Awaitable[str]]:
     return _const
 
 
+_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "push", "write"})
+_READ_PERMISSIONS = frozenset({"pull", "read", "triage"})
+
+
+def _normalize_permission(permission: str | None) -> str | None:
+    value = (permission or "").lower()
+    if value in _WRITE_PERMISSIONS:
+        return "write"
+    if value in _READ_PERMISSIONS:
+        return "read"
+    if value == "none":
+        return "none"
+    return None
+
+
 class GitHubProvider(BaseProvider):
     """GitHub code hosting provider."""
 
@@ -237,6 +252,31 @@ class GitHubProvider(BaseProvider):
             raise
         except Exception as e:
             raise ProviderError(f"Failed to fetch PR info: {e}") from e
+
+    async def get_repo_permission(
+        self,
+        owner: str,
+        repo: str,
+        username: str,
+        *,
+        user_id: int | None = None,
+    ) -> str | None:
+        """Fetch a user's collaborator permission, normalized for authz."""
+        token = await self._resolve_token()
+        gh = self._make_client(token)
+
+        def _fetch() -> str:
+            return gh.get_repo(f"{owner}/{repo}").get_collaborator_permission(username)
+
+        try:
+            permission = await asyncio.to_thread(_fetch)
+        except GithubException as exc:
+            if getattr(exc, "status", None) == 404:
+                return "none"
+            raise ProviderError(f"Failed to fetch repo permission for {username}: {exc}") from exc
+        except Exception as exc:
+            raise ProviderError(f"Failed to fetch repo permission for {username}: {exc}") from exc
+        return _normalize_permission(permission)
 
     async def get_pr_diff(self, pr_info: PRInfo) -> str:
         diff_url = f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/pulls/{pr_info.number}"
@@ -843,9 +883,12 @@ class GitHubProvider(BaseProvider):
         return threads
 
     async def get_pr_description(self, pr_info: PRInfo) -> str:
+        token = await self._resolve_token()
+        gh = self._make_client(token)
+
         @_retry_transient
         def _fetch() -> str:
-            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             return gh_repo.get_pull(pr_info.number).body or ""
 
         try:
@@ -856,9 +899,12 @@ class GitHubProvider(BaseProvider):
             raise ProviderError(f"Failed to fetch PR description: {e}") from e
 
     async def update_pr_description(self, pr_info: PRInfo, body: str) -> None:
+        token = await self._resolve_token()
+        gh = self._make_client(token)
+
         @_retry_transient
         def _edit() -> None:
-            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             gh_repo.get_pull(pr_info.number).edit(body=body)
 
         try:

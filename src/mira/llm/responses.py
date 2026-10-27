@@ -294,7 +294,20 @@ class ResponsesProvider(OpenAICompatibleProvider):
             logger.warning("Model returned content instead of tool call, using content as fallback")
             return validate_tool_arguments(text, provider=self.config.provider, model=api_model)
 
-        raise LLMError("no_tool_call")
+        # Neither a function call nor text. Carry the response shape on the
+        # error's full message — counts only, never reasoning text.
+        usage = data.get("usage") or {}
+        output_details = usage.get("output_tokens_details") or {}
+        detail = (
+            f"status={resp.status_code} "
+            f"response_status={data.get('status')} "
+            f"incomplete={(data.get('incomplete_details') or {}).get('reason')} "
+            f"output_items={[item.get('type') for item in output]} "
+            f"input_tokens={usage.get('input_tokens')} "
+            f"output_tokens={usage.get('output_tokens')} "
+            f"reasoning_tokens={output_details.get('reasoning_tokens')}"
+        )
+        raise LLMError("no_tool_call", detail=detail)
 
     async def _call_llm_agentic(
         self,

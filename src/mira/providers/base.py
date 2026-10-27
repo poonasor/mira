@@ -97,6 +97,22 @@ class BaseProvider(abc.ABC):
         """Fetch file content at a specific ref."""
         return ""
 
+    async def get_repo_permission(
+        self,
+        owner: str,
+        repo: str,
+        username: str,
+        *,
+        user_id: int | None = None,
+    ) -> str | None:
+        """Normalized repo permission for a user.
+
+        Returns ``"write"``, ``"read"``, ``"none"``, or ``None`` when the
+        platform cannot determine it. Command authorization treats anything
+        other than ``"write"`` as a denial.
+        """
+        return None
+
     # The methods below are called by the engine and merge handler. They have
     # safe defaults so a provider can ship without them and simply degrade
     # (no incremental re-review, no JIT context, no merge-time learning)
