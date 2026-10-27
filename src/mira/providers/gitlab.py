@@ -164,6 +164,50 @@ class GitLabProvider(BaseProvider):
             platform="gitlab",
         )
 
+    async def get_repo_permission(
+        self,
+        owner: str,
+        repo: str,
+        username: str,
+        *,
+        user_id: int | None = None,
+    ) -> str | None:
+        """Fetch a user's project access level, normalized for authz."""
+        pid = quote(f"{owner}/{repo}", safe="")
+        try:
+            if user_id is not None:
+                resp = await self._request(
+                    "GET",
+                    f"{self._api}/projects/{pid}/members/all/{user_id}",
+                    ok=(200, 404),
+                )
+                data = resp.json() if resp.status_code == 200 else None
+                member = data if isinstance(data, dict) else None
+            else:
+                members = await self._paginate(
+                    f"{self._api}/projects/{pid}/members/all?query={quote(username, safe='')}"
+                )
+                member = next(
+                    (m for m in members if (m.get("username") or "").lower() == username.lower()),
+                    None,
+                )
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"Failed to fetch repo permission for {username}: {exc}") from exc
+
+        if not member:
+            return "none"
+        try:
+            level = int(member.get("access_level") or 0)
+        except (TypeError, ValueError):
+            return None
+        if level >= 30:  # Developer / Maintainer / Owner
+            return "write"
+        if level >= 10:  # Guest / Reporter
+            return "read"
+        return "none"
+
     async def _changes(self, pr_info: PRInfo) -> dict[str, Any]:
         resp = await self._request("GET", f"{self._mr(pr_info)}/changes")
         return resp.json()

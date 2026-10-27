@@ -192,10 +192,15 @@ class OpenAICompatibleProvider:
     def _apply_reasoning(self, body: dict) -> None:
         """Enable extended thinking when a reasoning effort is configured.
 
-        The portable shape is the nested ``reasoning.effort`` knob. Provider
-        profiles can select another wire shape; Z.AI uses a top-level
+        The portable shape is the nested ``reasoning.effort`` knob, after any
+        per-provider remap from the profile. Anthropic models reject a custom
+        ``temperature`` while thinking is on, so we drop it. Provider profiles
+        can select another wire shape; Z.AI uses a top-level
         ``reasoning_effort`` plus ``thinking.type`` and defaults thinking on,
         so Mira must explicitly disable it when the configured effort is off.
+        For the nested style, when reasoning is off, endpoints that think by
+        default (DeepSeek) get the profile's explicit disable payload instead
+        of an omission; every other endpoint stays a no-op.
         """
         effort = self.config.reasoning_effort
         style = self.profile.get("reasoning_style", "nested")
@@ -209,6 +214,9 @@ class OpenAICompatibleProvider:
             return
 
         if not effort or effort == "off":
+            off_payload = self.profile.get("reasoning_off_payload")
+            if off_payload:
+                body.update(off_payload)
             return
         if body.get("model") in self._no_reasoning:
             return

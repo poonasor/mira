@@ -169,6 +169,41 @@ class FilterConfig(BaseModel):
     blocked_authors: list[str] = Field(default_factory=list)
 
 
+class CommandOverrideConfig(BaseModel):
+    """Per-command allow/deny override.
+
+    Setting ``allowed_users`` replaces the global command allowlist for this
+    command only. ``blocked_users`` adds command-specific denials on top of
+    the global deny list. The global ``allow_repo_write_access`` gate still
+    applies to every command.
+    """
+
+    allowed_users: list[str] | None = None
+    blocked_users: list[str] | None = None
+
+
+class CommandsConfig(BaseModel):
+    """Who may invoke interactive @-mention commands.
+
+    The default posture is repo writers/admins only. ``allowed_users`` grants
+    command access explicitly (including to read-only users), while
+    ``blocked_users`` always denies. Per-command overrides replace the global
+    user allowlist for that command only and may add command-specific denials;
+    the write-access gate stays global.
+    """
+
+    allowed_users: list[str] = Field(default_factory=list)
+    allow_repo_write_access: bool = True
+    blocked_users: list[str] = Field(default_factory=list)
+    review: CommandOverrideConfig | None = None
+    review_rest: CommandOverrideConfig | None = None
+    help: CommandOverrideConfig | None = None
+    pause: CommandOverrideConfig | None = None
+    resume: CommandOverrideConfig | None = None
+    reject: CommandOverrideConfig | None = None
+    ask: CommandOverrideConfig | None = None
+
+
 class OverlapConfig(BaseModel):
     """Cross-PR overlap detection ("stepping on each other's toes").
 
@@ -346,6 +381,7 @@ class DatabaseConfig(BaseModel):
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+    commands: CommandsConfig = Field(default_factory=CommandsConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     index: IndexConfig = Field(default_factory=IndexConfig)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -399,16 +435,19 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
 )
 
 
-def _strip_deployment_only_llm_settings(overlay: dict[str, Any]) -> dict[str, Any]:
-    """Remove execution and credential-routing settings from an untrusted per-repo overlay."""
+def _strip_deployment_only_settings(overlay: dict[str, Any]) -> dict[str, Any]:
+    """Remove deployment-only settings (execution, credential routing, command
+    authorization) from an untrusted per-repo overlay."""
     cleaned = dict(overlay)
     llm = cleaned.get("llm")
-    if not isinstance(llm, dict):
-        return cleaned
-    cleaned_llm = dict(llm)
-    for key in _DEPLOYMENT_ONLY_LLM_KEYS:
-        cleaned_llm.pop(key, None)
-    cleaned["llm"] = cleaned_llm
+    if isinstance(llm, dict):
+        cleaned_llm = dict(llm)
+        for key in _DEPLOYMENT_ONLY_LLM_KEYS:
+            cleaned_llm.pop(key, None)
+        cleaned["llm"] = cleaned_llm
+    # Command authorization is deployment-controlled: a repository must not
+    # be able to widen its own command allowlist.
+    cleaned.pop("commands", None)
     return cleaned
 
 
@@ -477,14 +516,14 @@ def load_config(
             raise ConfigError(f"Config file not found: {path}")
         overlay = _load_yaml(path)
         if not trust_execution_settings:
-            overlay = _strip_deployment_only_llm_settings(overlay)
+            overlay = _strip_deployment_only_settings(overlay)
         data = _deep_merge(data, overlay)
     else:
         found = find_config_file()
         if found:
             overlay = _load_yaml(found)
             if not trust_execution_settings:
-                overlay = _strip_deployment_only_llm_settings(overlay)
+                overlay = _strip_deployment_only_settings(overlay)
             data = _deep_merge(data, overlay)
 
     if overrides:

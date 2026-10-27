@@ -19,5 +19,12 @@
     "api_styles": ["chat"],
     "reasoning_style": "zai",
     "supports_forced_tool_choice": false
+  },
+
+  "deepseek": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "model_prefix": "strip",
+    "reasoning_off_payload": { "thinking": { "type": "disabled" } }
   }
 }

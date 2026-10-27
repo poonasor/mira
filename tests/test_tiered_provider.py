@@ -128,7 +128,7 @@ class TestFailover:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "error",
-        [http_failure(400), http_failure(422), LLMError("no_tool_call")],
+        [http_failure(400), http_failure(422), LLMError("no_tool_call", detail="empty")],
         ids=["400", "422", "no-tool-call"],
     )
     async def test_request_failure_fails_over_without_cooldown(
