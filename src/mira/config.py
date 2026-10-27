@@ -313,6 +313,11 @@ class ReviewConfig(BaseModel):
     # locally before pushing — only the final diff gets reviewed.
     review_on_synchronize: bool = True
 
+    # How long a PR's "review in progress" marker blocks a duplicate trigger.
+    # A review that hangs or dies without finishing its marker stops blocking
+    # new pushes and `@bot review` once the marker is this old.
+    in_progress_ttl_minutes: float = Field(default=20, gt=0)
+
 
 class IndexConfig(BaseModel):
     # Concurrent LLM summarization batches per repo during indexing. The

@@ -166,6 +166,7 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
             bot_name,
             platform="forgejo",
             pr_title=pr.get("title", "") or "",
+            head_sha=(pr.get("head") or {}).get("sha", "") or "",
         )
     except Exception:
         logger.exception(
