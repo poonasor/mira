@@ -126,6 +126,7 @@ async def handle_merge_request(payload: dict[str, Any], auth: PlatformAuth, bot_
             bot_name,
             platform="gitlab",
             pr_title=attrs.get("title", "") or "",
+            head_sha=(attrs.get("last_commit") or {}).get("id", "") or "",
         )
     except Exception:
         logger.exception("Error handling GitLab merge_request event for %s/%s!%s", owner, repo, iid)

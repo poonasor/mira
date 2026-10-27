@@ -49,6 +49,11 @@ _PAUSE_KEYWORDS = {"pause"}
 _RESUME_KEYWORDS = {"resume"}
 
 
+def _in_progress_ttl_seconds(config: Any) -> float:
+    """How long an in-progress marker may block a duplicate trigger."""
+    return float(config.review.in_progress_ttl_minutes) * 60
+
+
 def _open_store(owner: str, repo: str, platform: str = "github") -> IndexStore:
     """Open an IndexStore for the given owner/repo."""
     return IndexStore.open(owner, repo, platform=platform)
@@ -123,6 +128,7 @@ async def run_pr_review(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
+    head_sha: str = "",
 ) -> None:
     """Platform-neutral review core: review a PR/MR and post the result.
 
@@ -131,47 +137,50 @@ async def run_pr_review(
     every platform.
     """
     repo_full = f"{owner}/{repo}"
-
-    # Atomically claim the slot — avoids stacking redundant runs when
-    # two concurrent webhooks arrive. Returns False if already reviewing.
-    if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
-        logger.info("Review already in progress for %s, skipping", pr_url)
-        return
-
     config = load_config()
-    from mira.dashboard.models_config import llm_config_for
 
-    llm = create_llm(llm_config_for("review", config.llm))
-    indexing_llm = create_llm(llm_config_for("indexing", config.llm))
-    security_llm = create_llm(llm_config_for("security", config.llm))
-    engine = ReviewEngine(
-        config=config,
-        llm=llm,
-        provider=provider,
-        bot_name=bot_name,
-        indexing_llm=indexing_llm,
-        security_llm=security_llm,
-    )
+    # Atomically claim the slot — avoids stacking redundant runs when two
+    # concurrent webhooks arrive. The claim yields None if a live review
+    # already covers this head; it is always finished when the block exits,
+    # however the review ends (error, cancellation, hang past the TTL).
+    with review_tracker.claim(
+        repo_full,
+        number,
+        pr_title,
+        pr_url,
+        head_sha=head_sha,
+        ttl_seconds=_in_progress_ttl_seconds(config),
+    ) as run_id:
+        if run_id is None:
+            logger.info("Review already in progress for %s, skipping", pr_url)
+            return
 
-    from mira.dashboard.api import _app_db
+        llm = create_llm(llm_config_for("review", config.llm))
+        indexing_llm = create_llm(llm_config_for("indexing", config.llm))
+        security_llm = create_llm(llm_config_for("security", config.llm))
+        engine = ReviewEngine(
+            config=config,
+            llm=llm,
+            provider=provider,
+            bot_name=bot_name,
+            indexing_llm=indexing_llm,
+            security_llm=security_llm,
+        )
 
-    # Keep visibility current — the blast-radius filter relies on it to avoid
-    # naming private repos in a public repo's review.
-    try:
-        _app_db.set_repo_visibility(owner, repo, is_private, platform=platform)
-    except sqlite3.OperationalError as exc:
-        logger.debug("set_repo_visibility failed (ignored): %s", exc)
+        from mira.dashboard.api import _app_db
 
-    repo_record = _app_db.get_repo(owner, repo, platform=platform)
-    is_indexed = bool(repo_record and repo_record.status == "ready")
+        # Keep visibility current — the blast-radius filter relies on it to avoid
+        # naming private repos in a public repo's review.
+        try:
+            _app_db.set_repo_visibility(owner, repo, is_private, platform=platform)
+        except sqlite3.OperationalError as exc:
+            logger.debug("set_repo_visibility failed (ignored): %s", exc)
 
-    logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
-    try:
+        repo_record = _app_db.get_repo(owner, repo, platform=platform)
+        is_indexed = bool(repo_record and repo_record.status == "ready")
+
+        logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
         result = await engine.review_pr(pr_url)
-        review_tracker.complete(repo_full, number)
-    except Exception as exc:
-        review_tracker.fail(repo_full, number, str(exc))
-        raise
 
     # The walkthrough comment already carries the "more accurate after indexing"
     # nudge for unindexed repos, so we don't post a separate note here — that
@@ -239,18 +248,16 @@ async def run_pr_command(
             security_llm=security_llm,
         )
         engine._review_only_paths = set(progress.skipped_paths)  # type: ignore[attr-defined]
-        if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
-            logger.info("Review already in progress for %s, skipping", pr_url)
-            return
-        logger.info(
-            "review-rest on %s by @%s — %d file(s)", pr_url, actor, len(progress.skipped_paths)
-        )
-        try:
+        with review_tracker.claim(
+            repo_full, number, pr_title, pr_url, ttl_seconds=_in_progress_ttl_seconds(config)
+        ) as run_id:
+            if run_id is None:
+                logger.info("Review already in progress for %s, skipping", pr_url)
+                return
+            logger.info(
+                "review-rest on %s by @%s — %d file(s)", pr_url, actor, len(progress.skipped_paths)
+            )
             result = await engine.review_pr(pr_url)
-            review_tracker.complete(repo_full, number)
-        except Exception as exc:
-            review_tracker.fail(repo_full, number, str(exc))
-            raise
         await emit_review_events(repo_full, pr_url, number, result)
     elif is_review:
         engine = ReviewEngine(
@@ -261,16 +268,14 @@ async def run_pr_command(
             indexing_llm=indexing_llm,
             security_llm=security_llm,
         )
-        if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
-            logger.info("Review already in progress for %s, skipping", pr_url)
-            return
-        logger.info("Re-review triggered for %s by @%s", pr_url, actor)
-        try:
+        with review_tracker.claim(
+            repo_full, number, pr_title, pr_url, ttl_seconds=_in_progress_ttl_seconds(config)
+        ) as run_id:
+            if run_id is None:
+                logger.info("Review already in progress for %s, skipping", pr_url)
+                return
+            logger.info("Re-review triggered for %s by @%s", pr_url, actor)
             result = await engine.review_pr(pr_url)
-            review_tracker.complete(repo_full, number)
-        except Exception as exc:
-            review_tracker.fail(repo_full, number, str(exc))
-            raise
         await emit_review_events(repo_full, pr_url, number, result)
     else:
         pr_info = await provider.get_pr_info(pr_url)

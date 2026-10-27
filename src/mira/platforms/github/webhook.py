@@ -616,6 +616,7 @@ async def handle_pull_request(
             is_private,
             bot_name,
             pr_title=pr.get("title", ""),
+            head_sha=(pr.get("head") or {}).get("sha", "") or "",
         )
     except Exception as exc:
         logger.exception("Error handling pull_request event")
