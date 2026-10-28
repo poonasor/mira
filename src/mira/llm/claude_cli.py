@@ -290,6 +290,9 @@ async def log_claude_cli_version(config: LLMConfig, timeout: float = 15.0) -> st
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=home,
+                # Own process group, like _run: a signal aimed at the CLI's
+                # group must never reach Mira (PID 1 in the container).
+                start_new_session=os.name == "posix",
             )
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)

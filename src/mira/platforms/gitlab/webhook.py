@@ -87,7 +87,7 @@ def _split_project_path(path_with_namespace: str) -> tuple[str, str]:
 
 async def handle_merge_request(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """Review a merge request (open / reopen / new commits)."""
-    from mira.platforms.handlers import PAUSE_LABEL, run_pr_review
+    from mira.platforms.handlers import PAUSE_LABEL, failure_reported, run_pr_review
     from mira.platforms.index_handlers import _get_app_db
 
     attrs = payload.get("object_attributes", {})
@@ -128,8 +128,11 @@ async def handle_merge_request(payload: dict[str, Any], auth: PlatformAuth, bot_
             pr_title=attrs.get("title", "") or "",
             head_sha=(attrs.get("last_commit") or {}).get("id", "") or "",
         )
-    except Exception:
-        logger.exception("Error handling GitLab merge_request event for %s/%s!%s", owner, repo, iid)
+    except Exception as exc:
+        if not failure_reported(exc):  # run_pr_review logs + reports its own failures
+            logger.exception(
+                "Error handling GitLab merge_request event for %s/%s!%s", owner, repo, iid
+            )
 
 
 async def handle_gitlab_push(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:

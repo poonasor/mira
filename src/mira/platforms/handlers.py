@@ -4,9 +4,13 @@ none is tied to a specific platform's payload shape."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +128,11 @@ def review_completed_payload(repo_full: str, pr_url: str, number: int, result: A
         "head_sha": getattr(result, "head_sha", "") or "",
         # Final 1-5 confidence score for that head; None when not scored.
         "confidence_score": score if isinstance(score, int) else None,
+        # True when part of the diff was not reviewed (chunks whose output never
+        # parsed, or files the host returned no patch for), so the score and
+        # findings don't cover the whole PR.
+        "partial": bool(failed) or bool(getattr(result, "unreviewed_paths", None)),
+        "unreviewed_paths": list(getattr(result, "unreviewed_paths", None) or []),
     }
 
 
@@ -141,6 +150,112 @@ async def emit_review_events(repo_full: str, pr_url: str, number: int, result: A
     await dispatch_event(REVIEW_COMPLETED, event_data)
     if any(sev >= Severity.WARNING for sev in build_review_stats(result.comments)):
         await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)
+
+
+# Upper bound on the review.failed send, so a hung webhook target can't hold
+# up re-raising a cancellation during shutdown.
+_FAILED_EVENT_TIMEOUT_SECONDS = 10.0
+
+_FAILURE_REPORTED_ATTR = "_mira_review_failure_reported"
+
+
+def review_failed_payload(
+    repo_full: str, pr_url: str, number: int, head_sha: str, reason: str
+) -> dict:
+    """The ``review.failed`` webhook payload."""
+    return {
+        "repo": repo_full,
+        "pr_url": pr_url,
+        "number": number,
+        "pr": number,
+        "head_sha": head_sha or "",
+        "reason": reason,
+        # Older consumers (and the default message renderer) read ``error``.
+        "error": reason,
+    }
+
+
+def failure_reported(exc: BaseException) -> bool:
+    """Whether ``review.failed`` was already sent for this exception."""
+    return bool(getattr(exc, _FAILURE_REPORTED_ATTR, False))
+
+
+async def emit_review_failed(
+    repo_full: str, pr_url: str, number: int, head_sha: str, reason: str
+) -> None:
+    """Send ``review.failed``. Best-effort: never raises."""
+    from mira.outbound_webhooks import REVIEW_FAILED, dispatch_event
+
+    payload = review_failed_payload(repo_full, pr_url, number, head_sha, reason)
+    try:
+        await asyncio.wait_for(
+            dispatch_event(REVIEW_FAILED, payload), timeout=_FAILED_EVENT_TIMEOUT_SECONDS
+        )
+    except (Exception, asyncio.CancelledError) as exc:
+        logger.warning("Could not send review.failed for %s: %r", pr_url, exc)
+
+
+def _failure_reason(exc: BaseException) -> str:
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled before the review finished (shutdown, restart or task cancellation)"
+    detail = str(exc)
+    name = type(exc).__name__
+    return f"{name}: {detail}" if detail else name
+
+
+@asynccontextmanager
+async def report_review_failure(
+    repo_full: str, pr_url: str, number: int, head_sha: str = "", trigger: str = "review"
+) -> AsyncIterator[None]:
+    """Log and report any way a background review can end without a result.
+
+    Background review tasks run after the webhook already answered 200, so an
+    exception or cancellation here is otherwise invisible. Every exit other
+    than a clean one is logged at ERROR with its traceback and sent as
+    ``review.failed``, then re-raised. ``except Exception`` alone would miss
+    ``asyncio.CancelledError`` (and ``SystemExit``), which are BaseExceptions.
+    """
+    try:
+        yield
+    except BaseException as exc:
+        if failure_reported(exc):
+            raise
+        reason = _failure_reason(exc)
+        if isinstance(exc, Exception):
+            logger.exception("Review (%s) failed for %s: %s", trigger, pr_url, reason)
+        else:
+            logger.error(
+                "Review (%s) for %s ended by %s: %s",
+                trigger,
+                pr_url,
+                type(exc).__name__,
+                reason,
+                exc_info=True,
+            )
+        await emit_review_failed(repo_full, pr_url, number, head_sha, reason)
+        with suppress(Exception):
+            setattr(exc, _FAILURE_REPORTED_ATTR, True)
+        raise
+
+
+def mark_first_review(platform: str, owner: str, repo: str, number: int, result: Any) -> None:
+    """Stamp ``pull_requests.first_review_at`` once Mira has reviewed the PR.
+
+    The human-review webhook skips bot reviews, so without this a PR only
+    Mira reviewed stays "awaiting review" forever. Only GitHub fills the
+    pull_requests table (it has no platform column), so other platforms are
+    left alone. Keeps the earliest timestamp; never raises.
+    """
+    if platform != "github" or getattr(result, "skipped_reason", None):
+        return
+    try:
+        from mira.dashboard.api import _app_db
+
+        _app_db.set_pr_first_review(owner, repo, number, time.time())
+    except Exception as exc:
+        logger.warning(
+            "Could not record first review time for %s/%s#%s: %s", owner, repo, number, exc
+        )
 
 
 async def run_pr_review(
@@ -161,6 +276,34 @@ async def run_pr_review(
     through the ``provider`` abstraction and the engine, so it's the same for
     every platform.
     """
+    repo_full = f"{owner}/{repo}"
+    async with report_review_failure(repo_full, pr_url, number, head_sha, "pull request"):
+        await _run_pr_review(
+            provider,
+            owner,
+            repo,
+            number,
+            pr_url,
+            is_private,
+            bot_name,
+            platform=platform,
+            pr_title=pr_title,
+            head_sha=head_sha,
+        )
+
+
+async def _run_pr_review(
+    provider: Any,
+    owner: str,
+    repo: str,
+    number: int,
+    pr_url: str,
+    is_private: bool,
+    bot_name: str,
+    platform: str,
+    pr_title: str,
+    head_sha: str,
+) -> None:
     repo_full = f"{owner}/{repo}"
     config = load_config()
 
@@ -213,6 +356,7 @@ async def run_pr_review(
 
     logger.info("Review complete for %s", pr_url)
 
+    mark_first_review(platform, owner, repo, number, result)
     await emit_review_events(repo_full, pr_url, number, result)
 
 
@@ -271,56 +415,32 @@ async def run_pr_command(
         logger.info("Help requested on %s by @%s", pr_url, actor)
         return
 
-    if is_review_rest:
-        from mira.dashboard.api import _app_db
-
-        progress = _app_db.get_pr_review_progress(owner, repo, number, platform=platform)
-        if not progress or not progress.skipped_paths:
-            pr_info_for_reply = await provider.get_pr_info(pr_url)
-            await provider.post_comment(
-                pr_info_for_reply,
-                f"> @{actor}: nothing left to review — every file in this "
-                "PR has already been covered. 🎉",
+    if is_review or is_review_rest:
+        trigger = "review-rest" if is_review_rest else "review command"
+        async with report_review_failure(repo_full, pr_url, number, trigger=trigger):
+            result = await _run_command_review(
+                provider,
+                owner,
+                repo,
+                number,
+                pr_url,
+                actor,
+                pr_title,
+                platform,
+                config,
+                ReviewEngine(
+                    config=config,
+                    llm=llm,
+                    provider=provider,
+                    bot_name=bot_name,
+                    indexing_llm=indexing_llm,
+                    security_llm=security_llm,
+                ),
+                rest=is_review_rest,
             )
-            return
-        engine = ReviewEngine(
-            config=config,
-            llm=llm,
-            provider=provider,
-            bot_name=bot_name,
-            indexing_llm=indexing_llm,
-            security_llm=security_llm,
-        )
-        engine._review_only_paths = set(progress.skipped_paths)  # type: ignore[attr-defined]
-        with review_tracker.claim(
-            repo_full, number, pr_title, pr_url, ttl_seconds=_in_progress_ttl_seconds(config)
-        ) as run_id:
-            if run_id is None:
-                logger.info("Review already in progress for %s, skipping", pr_url)
-                return
-            logger.info(
-                "review-rest on %s by @%s — %d file(s)", pr_url, actor, len(progress.skipped_paths)
-            )
-            result = await engine.review_pr(pr_url)
-        await emit_review_events(repo_full, pr_url, number, result)
-    elif is_review:
-        engine = ReviewEngine(
-            config=config,
-            llm=llm,
-            provider=provider,
-            bot_name=bot_name,
-            indexing_llm=indexing_llm,
-            security_llm=security_llm,
-        )
-        with review_tracker.claim(
-            repo_full, number, pr_title, pr_url, ttl_seconds=_in_progress_ttl_seconds(config)
-        ) as run_id:
-            if run_id is None:
-                logger.info("Review already in progress for %s, skipping", pr_url)
-                return
-            logger.info("Re-review triggered for %s by @%s", pr_url, actor)
-            result = await engine.review_pr(pr_url)
-        await emit_review_events(repo_full, pr_url, number, result)
+        if result is not None:
+            mark_first_review(platform, owner, repo, number, result)
+            await emit_review_events(repo_full, pr_url, number, result)
     else:
         pr_info = await provider.get_pr_info(pr_url)
         diff_text = await provider.get_pr_diff(pr_info)
@@ -333,6 +453,53 @@ async def run_pr_command(
         response = await llm.complete(messages, json_mode=False)
         await provider.post_comment(pr_info, f"> @{actor} asked: {question}\n\n{response}")
         logger.info("Replied to comment on %s", pr_url)
+
+
+async def _run_command_review(
+    provider: Any,
+    owner: str,
+    repo: str,
+    number: int,
+    pr_url: str,
+    actor: str,
+    pr_title: str,
+    platform: str,
+    config: Any,
+    engine: Any,
+    *,
+    rest: bool,
+) -> Any:
+    """Run a ``review`` / ``review-rest`` command; None when nothing ran."""
+    repo_full = f"{owner}/{repo}"
+    if rest:
+        from mira.dashboard.api import _app_db
+
+        progress = _app_db.get_pr_review_progress(owner, repo, number, platform=platform)
+        if not progress or not progress.skipped_paths:
+            pr_info_for_reply = await provider.get_pr_info(pr_url)
+            await provider.post_comment(
+                pr_info_for_reply,
+                f"> @{actor}: nothing left to review — every file in this "
+                "PR has already been covered. 🎉",
+            )
+            return None
+        engine._review_only_paths = set(progress.skipped_paths)
+    with review_tracker.claim(
+        repo_full, number, pr_title, pr_url, ttl_seconds=_in_progress_ttl_seconds(config)
+    ) as run_id:
+        if run_id is None:
+            logger.info("Review already in progress for %s, skipping", pr_url)
+            return None
+        if rest:
+            logger.info(
+                "review-rest on %s by @%s — %d file(s)",
+                pr_url,
+                actor,
+                len(engine._review_only_paths),
+            )
+        else:
+            logger.info("Re-review triggered for %s by @%s", pr_url, actor)
+        return await engine.review_pr(pr_url)
 
 
 async def run_thread_reply(

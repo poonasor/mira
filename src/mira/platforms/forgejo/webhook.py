@@ -107,7 +107,7 @@ def _split_repo_path(full_name: str) -> tuple[str, str]:
 
 async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """Review a pull request (open / reopen / new commits)."""
-    from mira.platforms.handlers import PAUSE_LABEL, run_pr_review
+    from mira.platforms.handlers import PAUSE_LABEL, failure_reported, run_pr_review
     from mira.platforms.index_handlers import _get_app_db
 
     action = payload.get("action", "")
@@ -168,10 +168,11 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
             pr_title=pr.get("title", "") or "",
             head_sha=(pr.get("head") or {}).get("sha", "") or "",
         )
-    except Exception:
-        logger.exception(
-            "Error handling Forgejo pull_request event for %s/%s#%d", owner, repo_name, number
-        )
+    except Exception as exc:
+        if not failure_reported(exc):  # run_pr_review logs + reports its own failures
+            logger.exception(
+                "Error handling Forgejo pull_request event for %s/%s#%d", owner, repo_name, number
+            )
 
 
 async def handle_forgejo_push(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:

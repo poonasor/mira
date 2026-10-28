@@ -28,6 +28,8 @@ from mira.platforms.handlers import (
     _RESUME_KEYWORDS,
     PAUSE_LABEL,
     _open_store,
+    emit_review_failed,
+    failure_reported,
     run_pr_command,
     run_pr_merged_learning,
     run_pr_review,
@@ -610,15 +612,33 @@ async def handle_pull_request(
             pr_title=pr.get("title", ""),
             head_sha=(pr.get("head") or {}).get("sha", "") or "",
         )
-    except Exception as exc:
-        logger.exception("Error handling pull_request event")
-        if pr_url:
-            from mira.outbound_webhooks import REVIEW_FAILED, dispatch_event
-
-            await dispatch_event(
-                REVIEW_FAILED,
-                {"repo": repo_full, "pr_url": pr_url, "error": str(exc)},
+    except BaseException as exc:
+        # run_pr_review already logged and sent review.failed for anything that
+        # broke inside the review; this covers what fails before it starts.
+        if failure_reported(exc):
+            if isinstance(exc, Exception):
+                return
+            raise
+        if isinstance(exc, Exception):
+            logger.exception("Error handling pull_request event")
+        else:
+            logger.error(
+                "pull_request handler for %s ended by %s",
+                pr_url or "?",
+                type(exc).__name__,
+                exc_info=True,
             )
+        if pr_url:
+            pr_data = payload.get("pull_request") or {}
+            await emit_review_failed(
+                repo_full,
+                pr_url,
+                int(pr_data.get("number") or 0),
+                (pr_data.get("head") or {}).get("sha", "") or "",
+                f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__,
+            )
+        if not isinstance(exc, Exception):
+            raise
 
 
 async def handle_comment(
@@ -654,8 +674,9 @@ async def handle_comment(
             pr_title=payload["issue"].get("title", ""),
             user_id=payload["comment"]["user"].get("id"),
         )
-    except Exception:
-        logger.exception("Error handling comment event")
+    except Exception as exc:
+        if not failure_reported(exc):
+            logger.exception("Error handling comment event")
 
 
 async def handle_thread_reject(

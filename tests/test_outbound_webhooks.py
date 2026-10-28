@@ -460,6 +460,7 @@ class TestAdminEndpoints:
             nf.REVIEW_COMPLETED,
             nf.REVIEW_HIGH_SEVERITY,
             nf.REVIEW_FAILED,
+            nf.REVIEW_STALE,
             nf.INDEXING_COMPLETED,
         }
 

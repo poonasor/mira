@@ -82,6 +82,27 @@ def _ref_branch(ref: str) -> str:
     return ref
 
 
+def _missing_patch_paths(files: list[dict[str, Any]]) -> list[str]:
+    """Changed files that came back with no ``patch`` (so nothing to review).
+
+    Deletions and pure renames legitimately have no patch; when the API sends
+    line counts, a file only counts as missing when it reports changed lines.
+    """
+    missing: list[str] = []
+    for f in files:
+        name = f.get("filename") or ""
+        if not name or f.get("patch"):
+            continue
+        status = f.get("status") or "modified"
+        counts = [f.get(k) for k in ("additions", "deletions") if isinstance(f.get(k), int)]
+        if counts:
+            if sum(counts) > 0:
+                missing.append(name)
+        elif status not in ("removed", "renamed", "copied"):
+            missing.append(name)
+    return missing
+
+
 def _patches_to_diff(files: list[dict[str, Any]]) -> str:
     """Rebuild a unified diff from Origin per-file ``patch`` fields."""
     chunks: list[str] = []
@@ -141,6 +162,8 @@ class OriginProvider(BaseProvider):
         profile = profiles.resolve("origin")
         self._api = (profile.get("api_url") or "https://api.cursor.com/v1/origin").rstrip("/")
         self._identity: str | None = None
+        # Changed files the last get_pr_diff returned without a patch.
+        self.missing_patch_paths: list[str] = []
         # Origin IDs are opaque strings; BaseProvider uses int comment ids.
         # Intern string↔int for round-trips within this provider instance.
         self._id_to_int: dict[str, int] = {}
@@ -314,6 +337,15 @@ class OriginProvider(BaseProvider):
             raise
         except Exception as e:
             raise ProviderError(f"Failed to fetch Origin PR diff: {e}") from e
+        self.missing_patch_paths = _missing_patch_paths(files)
+        if self.missing_patch_paths:
+            logger.warning(
+                "Origin returned %d of %d changed file(s) without a patch for %s: %s",
+                len(self.missing_patch_paths),
+                len(files),
+                pr_info.url,
+                ", ".join(self.missing_patch_paths[:10]),
+            )
         return _patches_to_diff(files)
 
     async def get_compare_diff(self, pr_info: PRInfo, base_sha: str, head_sha: str) -> str:
