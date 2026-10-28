@@ -479,7 +479,7 @@ async def _run_command_review(
             pr_info_for_reply = await provider.get_pr_info(pr_url)
             await provider.post_comment(
                 pr_info_for_reply,
-                f"> @{actor}: nothing left to review — every file in this "
+                f"> {actor}: nothing left to review — every file in this "
                 "PR has already been covered. 🎉",
             )
             return None

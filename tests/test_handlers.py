@@ -761,6 +761,36 @@ async def test_review_rest_with_nothing_left_sends_nothing() -> None:
     assert _events(dispatch) == []
 
 
+async def test_review_rest_nothing_left_reply_does_not_mention_actor() -> None:
+    """The nothing-left reply quotes the actor without @, so no mention email."""
+    from mira.platforms.handlers import run_pr_command
+
+    with (
+        patch("mira.platforms.handlers.ReviewEngine", return_value=AsyncMock()),
+        patch("mira.platforms.handlers.create_llm"),
+        patch("mira.platforms.handlers.load_config", return_value=MagicMock()),
+        patch("mira.dashboard.api._app_db") as mock_db,
+        patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock),
+    ):
+        mock_db.get_pr_review_progress.return_value = None
+        provider = AsyncMock()
+        provider.get_repo_permission = AsyncMock(return_value="write")
+        await run_pr_command(
+            provider,
+            "testowner",
+            "testrepo",
+            7,
+            "https://github.com/testowner/testrepo/pull/7",
+            "review-rest",
+            "alice",
+            "mira-bot",
+        )
+
+    posted_body = provider.post_comment.call_args[0][1]
+    assert posted_body.startswith("> alice: nothing left to review")
+    assert "@alice" not in posted_body.splitlines()[0]
+
+
 @pytest.mark.parametrize(
     ("severity", "high"),
     [
