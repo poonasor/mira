@@ -128,7 +128,33 @@ def create_app(
         # configured; fire-and-forget so a slow CLI never delays startup.
         cli_version_task = asyncio.create_task(_log_claude_cli_version())
 
+        # Re-queue PRs whose review was lost (restart mid-review, crash).
+        sweep_task = None
+        if app_auth is not None:
+            from mira.config import load_config
+
+            if load_config().review.stale_sweep_enabled:
+                from mira.platforms.stale_sweep import run_forever as run_stale_sweep
+
+                sweep_task = asyncio.create_task(run_stale_sweep(app_auth, bot_name))
+                sweep_task.add_done_callback(
+                    lambda t: (
+                        logger.warning("Stale review sweep crashed: %s", t.exception())
+                        if not t.cancelled() and t.exception()
+                        else None
+                    )
+                )
+
         yield
+        from mira.platforms.lifecycle import active_reviews_summary, exit_reason
+
+        logger.warning(
+            "Mira lifespan shutdown (%s); reviews in flight: %s",
+            exit_reason(),
+            active_reviews_summary(),
+        )
+        if sweep_task is not None and not sweep_task.done():
+            sweep_task.cancel()
         if not cli_version_task.done():
             cli_version_task.cancel()
         if backfill_task is not None and not backfill_task.done():

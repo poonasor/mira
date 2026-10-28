@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 REVIEW_COMPLETED = "review.completed"
 REVIEW_FAILED = "review.failed"
 REVIEW_HIGH_SEVERITY = "review.high_severity"
+REVIEW_STALE = "review.stale"
 INDEXING_COMPLETED = "indexing.completed"
 
 # Surfaced to the Settings UI so it can render an event picker per webhook.
@@ -48,6 +49,11 @@ AVAILABLE_EVENTS: list[dict[str, str]] = [
         "value": REVIEW_FAILED,
         "label": "Review failed",
         "description": "When a review errors out instead of completing.",
+    },
+    {
+        "value": REVIEW_STALE,
+        "label": "Review stale",
+        "description": "When an open PR Mira received still has no completed review.",
     },
     {
         "value": INDEXING_COMPLETED,
@@ -175,6 +181,15 @@ def _message(event: str, data: dict[str, Any]) -> tuple[str, str, str]:
         title = f"❌ Mira review failed for {pr_ref}"
         body = f"*<{pr_url}|{pr_ref}>* — review failed: {err}"
         return title, body, "E01E5A"
+
+    if event == REVIEW_STALE:
+        age = data.get("age_minutes")
+        waited = f" for {age} min" if age is not None else ""
+        title = f"⏳ Mira has not reviewed {pr_ref}"
+        body = f"*<{pr_url}|{pr_ref}>* — open with no completed review{waited}"
+        if data.get("requeued"):
+            body += " · re-queued"
+        return title, body, "ECB22E"
 
     if event == INDEXING_COMPLETED:
         files = data.get("files_indexed", 0)
@@ -352,7 +367,19 @@ def sample_data(event: str) -> dict[str, Any]:
             "repo": "octocat/hello-world",
             "pr_url": "https://github.com/octocat/hello-world/pull/42",
             "number": 42,
+            "pr": 42,
+            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "reason": "example error (test delivery)",
             "error": "example error (test delivery)",
+        }
+    if event == REVIEW_STALE:
+        return {
+            "repo": "octocat/hello-world",
+            "pr_url": "https://github.com/octocat/hello-world/pull/42",
+            "number": 42,
+            "pr": 42,
+            "age_minutes": 45,
+            "requeued": True,
         }
     return {
         "repo": "octocat/hello-world",

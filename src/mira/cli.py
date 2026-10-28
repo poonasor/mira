@@ -381,13 +381,12 @@ def serve(
     try:
         import asyncio
 
-        import uvicorn
-
         from mira.config import set_global_defaults
         from mira.platforms.forgejo.auth import ForgejoTokenAuth
-        from mira.platforms.origin.auth import OriginAppAuth, OriginTokenAuth
         from mira.platforms.github.auth import GitHubAppAuth
         from mira.platforms.gitlab.auth import GitLabTokenAuth
+        from mira.platforms.lifecycle import run_server
+        from mira.platforms.origin.auth import OriginAppAuth, OriginTokenAuth
         from mira.platforms.server import create_app
     except ImportError as exc:
         raise click.ClickException(
@@ -504,7 +503,7 @@ def serve(
         if on
     )
     click.echo(f"Starting Mira webhook server ({platforms}) on {host}:{port}")
-    uvicorn.run(app, host=host, port=port)
+    run_server(app, host=host, port=port)
 
 
 @main.command("backfill-contributors")

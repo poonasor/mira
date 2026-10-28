@@ -265,7 +265,7 @@ async def handle_origin_pr(
     event_type: str,
 ) -> None:
     """Review a pull request on create / reopen / head push."""
-    from mira.platforms.handlers import run_pr_review
+    from mira.platforms.handlers import failure_reported, run_pr_review
     from mira.platforms.index_handlers import _get_app_db
 
     if event_type == "pull_request.head_ref.pushed" and not load_config().review.review_on_synchronize:
@@ -309,11 +309,13 @@ async def handle_origin_pr(
             bot_name,
             platform="origin",
             pr_title=pr.get("title", "") or "",
+            head_sha=(pr.get("head") or {}).get("sha", "") or "",
         )
-    except Exception:
-        logger.exception(
-            "Error handling Origin %s for %s/%s#%d", event_type, owner, repo_name, number
-        )
+    except Exception as exc:
+        if not failure_reported(exc):  # run_pr_review logs + reports its own failures
+            logger.exception(
+                "Error handling Origin %s for %s/%s#%d", event_type, owner, repo_name, number
+            )
 
 
 async def handle_origin_push(
