@@ -451,7 +451,7 @@ async def run_pr_command(
             pr_description=pr_info.description,
         )
         response = await llm.complete(messages, json_mode=False)
-        await provider.post_comment(pr_info, f"> @{actor} asked: {question}\n\n{response}")
+        await provider.post_comment(pr_info, f"> {actor} asked: {question}\n\n{response}")
         logger.info("Replied to comment on %s", pr_url)
 
 
