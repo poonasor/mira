@@ -431,6 +431,9 @@ class ReviewResult:
     total_chunks: int = 0
     # Head commit the review ran against (from the PR info the engine fetched).
     head_sha: str = ""
+    # Changed files the provider returned without patch content, so no code
+    # in them was reviewed (the review is partial).
+    unreviewed_paths: list[str] = field(default_factory=list)
 
     @property
     def confidence_score(self) -> int | None:
@@ -459,6 +462,17 @@ def score_marker(score: int | None, head_sha: str) -> str:
 def score_block(score: int | None, head_sha: str) -> str:
     """Score line plus marker, appended to the formal review body."""
     return f"{score_line(score, head_sha)}\n{score_marker(score, head_sha)}"
+
+
+def unreviewed_paths_note(paths: list[str]) -> str:
+    """One line saying the review is partial because some files had no patch."""
+    shown = ", ".join(f"`{p}`" for p in paths[:6])
+    more = f" and {len(paths) - 6} more" if len(paths) > 6 else ""
+    noun = "file" if len(paths) == 1 else "files"
+    return (
+        f"> ⚠️ **Partial review:** the diff for {len(paths)} changed {noun} "
+        f"({shown}{more}) came back without patch content, so that code was not reviewed."
+    )
 
 
 def failed_chunks_note(failed_chunks: list[dict], total_chunks: int) -> str:

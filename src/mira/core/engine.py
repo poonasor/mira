@@ -62,6 +62,7 @@ from mira.models import (
     WalkthroughResult,
     build_review_stats,
     failed_chunks_note,
+    unreviewed_paths_note,
 )
 from mira.providers.base import BaseProvider
 from mira.security.secrets_scan import scan_secrets
@@ -129,6 +130,33 @@ def compose_pr_description(current_body: str, summary_block: str, mode: str) -> 
     if current_body.strip():
         return current_body.rstrip() + "\n\n" + summary_block
     return summary_block
+
+
+def _mark_partial_review(result: ReviewResult, unreviewed_paths: list[str]) -> None:
+    """Flag a review that didn't see all the code, and withhold an unbacked score.
+
+    The walkthrough rates confidence from PR metadata (titles, file list),
+    so it can produce a score even when no code was reviewed. A score is only
+    kept when at least one chunk of real diff content was reviewed.
+    """
+    result.unreviewed_paths = list(unreviewed_paths)
+    wt = result.walkthrough
+    if wt is None:
+        return
+    if unreviewed_paths:
+        note = unreviewed_paths_note(unreviewed_paths)
+        wt.summary = f"{note}\n\n{wt.summary}" if wt.summary else note
+    all_failed = result.total_chunks > 0 and len(result.failed_chunks) >= result.total_chunks
+    nothing_with_patch = bool(unreviewed_paths) and not (
+        set(result.total_paths) - set(unreviewed_paths)
+    )
+    if wt.confidence_score is not None and (all_failed or nothing_with_patch):
+        logger.warning(
+            "Withholding confidence score %d: no diff content was reviewed (%s)",
+            wt.confidence_score.score,
+            "every chunk failed" if all_failed else "no changed file had patch content",
+        )
+        wt.confidence_score = None
 
 
 def _clamp_confidence_to_findings(
@@ -601,6 +629,11 @@ class ReviewEngine:
         )
 
         threads_checked, llm_resolved, unresolved_threads, thread_decisions = thread_result
+        # Files the provider listed as changed but returned without a patch.
+        missing = getattr(self.provider, "missing_patch_paths", None)
+        unreviewed_paths = (
+            [p for p in missing if isinstance(p, str)] if isinstance(missing, list) else []
+        )
 
         _lines_changed = sum(
             1 for line in diff_text.splitlines() if line.startswith("+") or line.startswith("-")
@@ -820,6 +853,7 @@ class ReviewEngine:
                 if result.key_issues:
                     result.key_issues = _drop_orphan_key_issues(result.key_issues, kept)
 
+        _mark_partial_review(result, unreviewed_paths)
         if result.walkthrough:
             _clamp_confidence_to_findings(result.walkthrough, result.comments)
             if self.dry_run:

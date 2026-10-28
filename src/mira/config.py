@@ -353,6 +353,16 @@ class ReviewConfig(BaseModel):
     # new pushes and `@bot review` once the marker is this old.
     in_progress_ttl_minutes: float = Field(default=20, gt=0)
 
+    # Stale-review sweep (GitHub): on startup and every N minutes, find open
+    # PRs Mira received but never finished reviewing (e.g. the process
+    # restarted mid-review), log them and re-queue each once per process.
+    stale_sweep_enabled: bool = True
+    stale_sweep_interval_minutes: float = Field(default=30, gt=0)
+    # Only PRs opened at least this long ago (gives a normal review time to finish)...
+    stale_sweep_min_age_minutes: float = Field(default=30, gt=0)
+    # ...and no longer ago than this, so installing Mira never mass-reviews a backlog.
+    stale_sweep_max_age_hours: float = Field(default=72, gt=0)
+
 
 class IndexConfig(BaseModel):
     # Concurrent LLM summarization batches per repo during indexing. The
