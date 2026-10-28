@@ -82,6 +82,44 @@ def _ref_branch(ref: str) -> str:
     return ref
 
 
+def _file_section(f: dict[str, Any]) -> list[str]:
+    """One file's git-style diff section, as lines with no trailing blank.
+
+    An empty ``patch`` (pure rename/copy, empty added or deleted file, binary,
+    mode-only change) gets the extended git header alone: ``rename from/to``,
+    ``new file mode``/``deleted file mode``, and no ``---``/``+++`` pair or
+    hunk, which is exactly what ``git diff`` emits for those cases. A bare
+    header pair followed by a blank line is not valid — unidiff rejects it with
+    "Unexpected trailing newline character" as soon as another file follows.
+    """
+    filename = f.get("filename") or ""
+    previous = f.get("previousFilename") or ""
+    status = f.get("status") or "modified"
+    patch = (f.get("patch") or "").removesuffix("\n")
+
+    if status in ("renamed", "copied") and previous and previous != filename:
+        verb = "rename" if status == "renamed" else "copy"
+        lines = [
+            f"diff --git a/{previous} b/{filename}",
+            f"{verb} from {previous}",
+            f"{verb} to {filename}",
+        ]
+        old, new = f"a/{previous}", f"b/{filename}"
+    elif status == "added":
+        lines = [f"diff --git a/{filename} b/{filename}", "new file mode 100644"]
+        old, new = "/dev/null", f"b/{filename}"
+    elif status == "removed":
+        lines = [f"diff --git a/{filename} b/{filename}", "deleted file mode 100644"]
+        old, new = f"a/{filename}", "/dev/null"
+    else:
+        lines = [f"diff --git a/{filename} b/{filename}"]
+        old, new = f"a/{filename}", f"b/{filename}"
+
+    if patch:
+        lines += [f"--- {old}", f"+++ {new}", patch]
+    return lines
+
+
 def _missing_patch_paths(files: list[dict[str, Any]]) -> list[str]:
     """Changed files that came back with no ``patch`` (so nothing to review).
 
@@ -105,37 +143,11 @@ def _missing_patch_paths(files: list[dict[str, Any]]) -> list[str]:
 
 def _patches_to_diff(files: list[dict[str, Any]]) -> str:
     """Rebuild a unified diff from Origin per-file ``patch`` fields."""
-    chunks: list[str] = []
+    lines: list[str] = []
     for f in files:
-        filename = f.get("filename") or ""
-        previous = f.get("previousFilename") or ""
-        status = f.get("status") or "modified"
-        patch = f.get("patch") or ""
-        if not filename:
-            continue
-        if status == "added":
-            chunks.append(f"diff --git a/{filename} b/{filename}")
-            chunks.append("new file mode 100644")
-            chunks.append("--- /dev/null")
-            chunks.append(f"+++ b/{filename}")
-        elif status == "removed":
-            chunks.append(f"diff --git a/{filename} b/{filename}")
-            chunks.append("deleted file mode 100644")
-            chunks.append(f"--- a/{filename}")
-            chunks.append("+++ /dev/null")
-        elif status in ("renamed", "copied") and previous:
-            chunks.append(f"diff --git a/{previous} b/{filename}")
-            chunks.append(f"--- a/{previous}")
-            chunks.append(f"+++ b/{filename}")
-        else:
-            chunks.append(f"diff --git a/{filename} b/{filename}")
-            chunks.append(f"--- a/{filename}")
-            chunks.append(f"+++ b/{filename}")
-        if patch:
-            chunks.append(patch if patch.endswith("\n") else patch + "\n")
-        else:
-            chunks.append("")
-    return "\n".join(chunks).rstrip() + ("\n" if chunks else "")
+        if f.get("filename"):
+            lines += _file_section(f)
+    return "\n".join(lines) + "\n" if lines else ""
 
 
 class OriginProvider(BaseProvider):

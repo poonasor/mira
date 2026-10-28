@@ -1170,6 +1170,18 @@ class ReviewEngine:
                 summary="No files were selected for review.",
                 skipped_reason="All files exceeded size limits or were deprioritized.",
             )
+        if not any(f.hunks for f in selected):
+            # Pure renames, empty added/deleted files and mode-only changes
+            # carry no hunks: there is no code to review and no line to anchor
+            # a comment to, so don't hand the model bare file metadata (and
+            # don't score it).
+            return ReviewResult(
+                summary="No line changes to review.",
+                skipped_reason=(
+                    "No line changes to review: the diff has no hunks (renames, "
+                    "empty files, mode changes, or patches the host did not return)."
+                ),
+            )
 
         all_paths = [f.path for f in filtered]
         selected_paths = [f.path for f in selected]
