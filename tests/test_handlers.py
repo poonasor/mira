@@ -357,7 +357,7 @@ async def test_handle_comment_formats_reply_with_attribution(
     mock_app_auth: AsyncMock,
     mock_pr_info: PRInfo,
 ) -> None:
-    """Reply includes '> @user asked:' attribution prefix."""
+    """Reply includes '> user asked:' attribution prefix (no @, so no mention)."""
     mock_config.return_value = MiraConfig()
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value="It's an O(n^2) loop.")
@@ -374,7 +374,8 @@ async def test_handle_comment_formats_reply_with_attribution(
     await handle_comment(payload, mock_app_auth, "mira-bot")
 
     posted_body = mock_provider.post_comment.call_args[0][1]
-    assert posted_body.startswith("> @alice asked: why is this slow?")
+    assert posted_body.startswith("> alice asked: why is this slow?")
+    assert "@alice" not in posted_body.splitlines()[0]
     assert "O(n^2)" in posted_body
 
 
