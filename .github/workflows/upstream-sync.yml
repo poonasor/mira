@@ -16,6 +16,8 @@ concurrency:
 env:
   UPSTREAM: https://github.com/miracodeai/mira.git
   SYNC_BRANCH: sync/upstream
+  # gh prefers a remote named 'upstream'; pin it to this fork.
+  GH_REPO: ${{ github.repository }}
   # Paths whose change means a human (Ricky) must review before merge.
   SCORING_PATHS: >-
     src/mira/core/engine.py src/mira/core/passes.py src/mira/core/ensemble.py
