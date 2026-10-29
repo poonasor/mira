@@ -60,9 +60,10 @@ from mira.models import (
     ThreadDecision,
     UnresolvedThread,
     WalkthroughResult,
+    _format_stats_breakdown,
     build_review_stats,
 )
-from mira.providers.base import BaseProvider
+from mira.providers.base import BaseProvider, CheckConclusion
 from mira.security.secrets_scan import scan_secrets
 
 logger = logging.getLogger(__name__)
@@ -450,6 +451,76 @@ class ReviewEngine:
         await self.provider.post_comment(pr_info, placeholder)
         return await self.provider.find_bot_comment(pr_info, WALKTHROUGH_MARKER)
 
+    _CHECK_CONCLUSIONS: dict[str, tuple[CheckConclusion, str, str]] = {
+        "success": (
+            "success",
+            "Code Review Complete",
+            "Review finished successfully. Findings (if any) were posted as PR/file comments.",
+        ),
+        "failure": (
+            "failure",
+            "Code Review Failed",
+            "The review stopped due to an unexpected error and did not produce findings.",
+        ),
+        "neutral": (
+            "neutral",
+            "Code Review Completed with Warnings",
+            "Review finished, but the walkthrough summary could not be "
+            "generated. Findings (if any) were posted as PR/file comments.",
+        ),
+    }
+
+    async def _start_check(self, pr_info: PRInfo) -> int | None:
+        """Best-effort: start a check run for the head commit; never fails a review."""
+        if self.dry_run or self.provider is None or not pr_info.head_sha:
+            return None
+        try:
+            return await self.provider.start_check_run(
+                pr_info,
+                title="Code Review In Progress",
+                summary="Mira is analyzing your code changes…",
+                details_url=pr_info.url,
+            )
+        except Exception as exc:
+            logger.warning("Failed to start check run for %s: %s", pr_info.url, exc)
+            return None
+
+    @staticmethod
+    def _check_details(result: ReviewResult | None) -> str:
+        """Expandable DETAILS text for the finished check run (review stats)."""
+        if result is None:
+            return ""
+        parts: list[str] = []
+        if result.reviewed_files:
+            parts.append(
+                f"{result.reviewed_files} file{'s' if result.reviewed_files != 1 else ''} reviewed"
+            )
+        if result.comments:
+            stats = _format_stats_breakdown(build_review_stats(result.comments))
+            parts.append(
+                f"{len(result.comments)} comment{'s' if len(result.comments) != 1 else ''}{stats}"
+            )
+        return " · ".join(parts)
+
+    async def _finish_check(
+        self, pr_info: PRInfo, run_id: int | None, status_key: str, result: ReviewResult | None
+    ) -> None:
+        """Best-effort: complete the check run (success/failure/neutral)."""
+        if run_id is None:
+            return
+        conclusion, title, summary = self._CHECK_CONCLUSIONS[status_key]
+        try:
+            await self.provider.finish_check_run(  # type: ignore[union-attr]
+                pr_info,
+                run_id,
+                conclusion,
+                title=title,
+                summary=summary,
+                details=self._check_details(result),
+            )
+        except Exception as exc:
+            logger.warning("Failed to finish check run for %s: %s", pr_info.url, exc)
+
     @staticmethod
     def _format_failure_notice(exc: BaseException) -> str:
         """Format a user-safe failure notice without model names or internal errors."""
@@ -540,7 +611,35 @@ class ReviewEngine:
             return []
 
     async def review_pr(self, pr_url: str) -> ReviewResult:
-        """Full pipeline: fetch PR -> review -> post results.
+        """Fetch PR metadata, publish a check run, and run the review pipeline."""
+        if not self.provider:
+            raise RuntimeError("A provider is required for PR review")
+
+        pr_info = await self.provider.get_pr_info(pr_url)
+        self._pr_info = pr_info
+
+        run_id = await self._start_check(pr_info)
+        try:
+            result = await self._review_pr(pr_info)
+        except BaseException:
+            await self._finish_check(pr_info, run_id, "failure", None)
+            raise
+        # Neutral only when a walkthrough was enabled AND generation was
+        # genuinely attempted but produced nothing (e.g. the LLM call failed).
+        # A disabled walkthrough, or a review skipped before any generation
+        # (no files, all files filtered, docs-only, no-new-commit re-reviews),
+        # finishes as success.
+        walkthrough_missing = (
+            self.config.review.walkthrough
+            and result.skipped_reason is None
+            and result.walkthrough is None
+        )
+        status_key = "neutral" if walkthrough_missing else "success"
+        await self._finish_check(pr_info, run_id, status_key, result)
+        return result
+
+    async def _review_pr(self, pr_info: PRInfo) -> ReviewResult:
+        """Core review pipeline: review the fetched PR and post results.
 
         Runs thread resolution and diff fetching in parallel to reduce latency.
         """
@@ -549,11 +648,7 @@ class ReviewEngine:
 
         _review_start = _time.monotonic()
 
-        if not self.provider:
-            raise RuntimeError("A provider is required for PR review")
-
-        pr_info = await self.provider.get_pr_info(pr_url)
-        self._pr_info = pr_info
+        assert self.provider is not None
 
         async def _resolve_threads() -> tuple[
             int, int, list[UnresolvedThread], list[ThreadDecision]
@@ -1076,7 +1171,10 @@ class ReviewEngine:
         # walkthrough can surface skipped files to the user.
         patch = parse_diff(diff_text)
         if not patch.files:
-            return ReviewResult(summary="No files to review.")
+            return ReviewResult(
+                summary="No files to review.",
+                skipped_reason="No files to review",
+            )
 
         filtered = filter_files(patch.files, self.config.filter)
         if not filtered:
@@ -1138,9 +1236,11 @@ class ReviewEngine:
                 # arguments (mid-string token glitches) that no JSON repair pass
                 # can fix. One bad sample used to drop the walkthrough for the
                 # whole run, so retry the generate→parse pair a few times before
-                # giving up; prompt building stays outside the loop.
+                # giving up; prompt building stays outside the loop. On the first
+                # schema-invalid response, also tell the model what was wrong.
                 walkthrough_attempts = 3
                 last_walkthrough_error: Exception | None = None
+                corrective_sent = False
                 for attempt in range(1, walkthrough_attempts + 1):
                     try:
                         wt_raw = await self.llm.walkthrough(wt_messages)
@@ -1153,7 +1253,23 @@ class ReviewEngine:
                             walkthrough_attempts,
                             exc,
                         )
+                        if isinstance(exc, ResponseParseError) and not corrective_sent:
+                            corrective_sent = True
+                            wt_messages = [
+                                *wt_messages,
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "The previous walkthrough response was invalid. "
+                                        "Submit the walkthrough again with a non-empty summary "
+                                        "and change_groups using the declared JSON schema. "
+                                        "Do not include tool-call XML in any field."
+                                    ),
+                                },
+                            ]
                         continue
+                    if not self.config.review.walkthrough_sequence_diagram:
+                        wt_parsed.sequence_diagram = None
                     return convert_to_walkthrough_result(wt_parsed)
                 logger.warning(
                     "Walkthrough generation failed after %d attempts, skipping: %s",

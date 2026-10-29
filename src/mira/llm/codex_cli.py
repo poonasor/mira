@@ -108,6 +108,8 @@ class CodexCLIProvider(CLIProviderBase):
         for feature in _DISABLED_FEATURES:
             cmd.extend(["--disable", feature])
         cmd.extend(["-c", 'web_search="disabled"'])
+        if self.config.reasoning_effort and self.config.reasoning_effort != "off":
+            cmd.extend(["-c", f'model_reasoning_effort="{self.config.reasoning_effort}"'])
         if self.config.model not in {"", "default", "codex-default"}:
             cmd.extend(["-m", self.config.model])
         cmd.append("-")

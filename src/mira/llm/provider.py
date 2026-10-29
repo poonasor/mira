@@ -58,7 +58,9 @@ class LLMProvider(OpenAICompatibleProvider):
             "model": _strip_model_prefix(model, self.config.base_url),
             "messages": messages,
             "temperature": temperature if temperature is not None else self.config.temperature,
-            "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
+            self._max_tokens_field(): (
+                max_tokens if max_tokens is not None else self.config.max_tokens
+            ),
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
@@ -105,7 +107,7 @@ class LLMProvider(OpenAICompatibleProvider):
             # can select "auto" up front; unknown rejections fall back below.
             "tool_choice": self._tool_choice(api_model, forced_choice),
             "temperature": temperature if temperature is not None else self.config.temperature,
-            "max_tokens": self.config.max_tokens,
+            self._max_tokens_field(): self.config.max_tokens,
         }
         self._apply_reasoning(body)
 
@@ -127,7 +129,7 @@ class LLMProvider(OpenAICompatibleProvider):
                     self._chat_url(),
                     (time.monotonic() - started) * 1000,
                     self.config.request_timeout,
-                    "reasoning" in body,
+                    self._has_reasoning(body),
                     type(exc).__name__,
                     exc,
                 )
@@ -149,6 +151,9 @@ class LLMProvider(OpenAICompatibleProvider):
             ):
                 # Reasoning effort unsupported on this model/endpoint — drop it
                 # and review without thinking instead of failing the review.
+                # Re-apply the provider's explicit off payload where one exists
+                # (DeepSeek), so removing the field doesn't leave default-on
+                # thinking in place.
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
                 self._disable_reasoning(body)
@@ -220,7 +225,7 @@ class LLMProvider(OpenAICompatibleProvider):
             "tools": tools,
             "tool_choice": "auto",
             "temperature": temperature if temperature is not None else self.config.temperature,
-            "max_tokens": self.config.max_tokens,
+            self._max_tokens_field(): self.config.max_tokens,
         }
         self._apply_reasoning(body)
 

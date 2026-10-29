@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +21,7 @@ from mira.core.engine import (
     _security_relevant_files,
 )
 from mira.core.threads import _extract_sections
+from mira.exceptions import ProviderError
 from mira.llm.provider import LLMProvider
 from mira.models import (
     WALKTHROUGH_MARKER,
@@ -458,6 +460,86 @@ class TestReviewEngine:
         assert result.walkthrough is not None
         assert isinstance(result.walkthrough, WalkthroughResult)
         assert result.walkthrough.summary != ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("retry", [False, True])
+    @pytest.mark.parametrize("mode", ["diff", "pr"])
+    async def test_walkthrough_diagram_setting_is_enforced(
+        self, mock_llm, mock_provider, sample_diff_text, enabled, retry, mode
+    ):
+        response = json.loads(_WALKTHROUGH_LLM_RESPONSE)
+        response["sequence_diagram"] = 'graph LR\n  a["Input"] --> b["Output"]'
+        raw = json.dumps(response)
+        mock_llm.walkthrough.side_effect = ["{}", raw] if retry else [raw]
+        mock_provider.get_all_bot_threads.return_value = []
+        mock_provider.find_bot_comment.return_value = 42
+        config = MiraConfig()
+        config.review.walkthrough_sequence_diagram = enabled
+        config.review.security_pass = False
+        config.review.self_critique = False
+        config.review.include_summary = False
+        config.review.code_context = False
+        config.review.overlap.enabled = False
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+
+        result = (
+            await engine.review_diff(sample_diff_text)
+            if mode == "diff"
+            else await engine.review_pr("https://github.com/test/repo/pull/1")
+        )
+
+        assert result.walkthrough is not None
+        assert result.walkthrough.summary == response["summary"]
+        assert result.walkthrough.sequence_diagram == (
+            response["sequence_diagram"] if enabled else None
+        )
+        assert ("```mermaid" in result.walkthrough.to_markdown()) is enabled
+        assert mock_llm.walkthrough.await_count == (2 if retry else 1)
+        if mode == "pr":
+            bodies = [call.args[2] for call in mock_provider.update_comment.call_args_list]
+            progress = [body for body in bodies if "Code review in progress" in body]
+            assert progress
+            assert all(("```mermaid" in body) is enabled for body in progress)
+            assert "Code review in progress" not in bodies[-1]
+            assert ("```mermaid" in bodies[-1]) is enabled
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_response", ["{}", '{"summary":"Changes.</invoke>"}'])
+    async def test_walkthrough_retries_invalid_content(
+        self, mock_llm: LLMProvider, sample_diff_text: str, bad_response: str
+    ):
+        mock_llm.walkthrough.side_effect = [bad_response, _WALKTHROUGH_LLM_RESPONSE]
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm)
+
+        result = await engine.review_diff(sample_diff_text)
+
+        assert result.walkthrough is not None
+        assert result.walkthrough.summary == "PR walkthrough summary."
+        assert mock_llm.walkthrough.await_count == 2
+        retry_messages = mock_llm.walkthrough.call_args.args[0]
+        assert retry_messages[-1]["role"] == "user"
+        assert "non-empty summary" in retry_messages[-1]["content"]
+        assert result.reviewed_files > 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_walkthrough_finalizes_placeholder_with_notice(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        mock_llm.walkthrough.return_value = "{}"
+        mock_provider.find_bot_comment.return_value = 42
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+
+        result = await engine.review_pr("https://github.com/owner/repo/pull/42")
+
+        # The fork retries the walkthrough up to 3 times (corrupted tool-call
+        # arguments); upstream's corrective prompt rides on the first retry.
+        assert mock_llm.walkthrough.await_count == 3
+        assert result.walkthrough is None
+        assert result.reviewed_files > 0
+        bodies = [c.args[2] for c in mock_provider.update_comment.call_args_list]
+        assert any("Walkthrough was not generated." in body for body in bodies)
+        assert not any("files reviewed" in body for body in bodies)
 
     @pytest.mark.asyncio
     async def test_walkthrough_disabled(self, sample_llm_response_text: str, sample_diff_text: str):
@@ -939,6 +1021,195 @@ class TestReviewEngine:
         assert "ValueError" in second_body
 
 
+class TestCheckRunLifecycle:
+    """`review_pr` starts a check run on the head commit and completes it
+    with success/failure (neutral when the walkthrough is missing)."""
+
+    def _engine(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock, *, dry_run: bool = False
+    ) -> ReviewEngine:
+        return ReviewEngine(
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=mock_provider,
+            dry_run=dry_run,
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_pr_starts_and_completes_check_run(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.start_check_run.assert_awaited_once()
+        start_kwargs = mock_provider.start_check_run.await_args.kwargs
+        assert start_kwargs["details_url"] == pr_info.url
+        assert "In Progress" in start_kwargs["title"]
+        mock_provider.finish_check_run.assert_awaited_once()
+        finish = mock_provider.finish_check_run.await_args
+        assert finish.args[1] == 42
+        assert finish.args[2] == "success"
+        # The expandable DETAILS section carries the review stats.
+        details = finish.kwargs["details"]
+        assert "2 files reviewed" in details
+        assert "3 comments" in details
+        # 1 fixture blocker (eval) + the secrets scanner blocking the
+        # hard-coded API key in the fixture diff, leaving 1 warning.
+        assert "2 blockers" in details
+        assert "1 warning" in details
+
+    @pytest.mark.asyncio
+    async def test_review_pr_completes_check_run_with_failure_on_error(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_pr_diff.side_effect = RuntimeError("boom")
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        with pytest.raises(RuntimeError, match="boom"):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.finish_check_run.assert_awaited_once()
+        finish = mock_provider.finish_check_run.await_args
+        assert finish.args[1] == 42
+        assert finish.args[2] == "failure"
+        # No result on a failed review → nothing to show in DETAILS.
+        assert finish.kwargs["details"] == ""
+
+    @pytest.mark.asyncio
+    async def test_review_pr_dry_run_skips_check_runs(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.post_review = AsyncMock()
+
+        engine = self._engine(mock_llm, mock_provider, dry_run=True)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.start_check_run.assert_not_awaited()
+        mock_provider.finish_check_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_review_pr_completes_check_run_neutral_without_walkthrough(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A completed review whose walkthrough is missing → neutral, not failure."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+        mock_llm.walkthrough = AsyncMock(side_effect=RuntimeError("walkthrough down"))
+
+        engine = self._engine(mock_llm, mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "neutral"
+
+    @pytest.mark.asyncio
+    async def test_review_pr_disabled_walkthrough_not_neutral(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A disabled (not failed) missing walkthrough is a plain success."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+        mock_llm.walkthrough = AsyncMock(side_effect=RuntimeError("irrelevant"))
+
+        config = MiraConfig()
+        config.review.walkthrough = False
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "success"
+
+    @pytest.mark.asyncio
+    async def test_review_pr_empty_diff_skip_not_neutral(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A walkthrough-enabled review skipped on an empty diff is a plain
+        success — no generation was ever attempted."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.get_pr_diff.return_value = ""
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        assert result.skipped_reason is not None
+        assert result.walkthrough is None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "success"
+
+    @pytest.mark.asyncio
+    async def test_review_pr_all_files_filtered_skip_not_neutral(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A walkthrough-enabled review where every file is excluded by the
+        filters is a plain success — no generation was ever attempted."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.get_pr_diff.return_value = (
+            "diff --git a/poetry.lock b/poetry.lock\n"
+            "--- a/poetry.lock\n"
+            "+++ b/poetry.lock\n"
+            "@@ -1,1 +1,2 @@\n"
+            " line\n"
+            "+new\n"
+        )
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        assert result.skipped_reason is not None
+        assert result.walkthrough is None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "success"
+
+    @pytest.mark.asyncio
+    async def test_check_run_provider_errors_never_fail_the_review(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """Provider exceptions in start/finish are logged, not raised."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+
+        # Failed start: review still succeeds; nothing to finish afterwards.
+        mock_provider.start_check_run = AsyncMock(side_effect=ProviderError("start boom"))
+        mock_provider.finish_check_run = AsyncMock()
+        engine = self._engine(mock_llm, mock_provider)
+        assert await engine.review_pr("https://github.com/test/repo/pull/1") is not None
+        mock_provider.start_check_run.assert_awaited_once()
+        mock_provider.finish_check_run.assert_not_awaited()
+
+        # Failed finish: review still succeeds.
+        mock_provider.reset_mock()
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+        mock_provider.finish_check_run = AsyncMock(side_effect=ProviderError("finish boom"))
+        assert await engine.review_pr("https://github.com/test/repo/pull/1") is not None
+        mock_provider.finish_check_run.assert_awaited_once()
+
+
 class TestDryRun:
     """Tests for dry-run mode — full pipeline without write operations."""
 
@@ -1352,6 +1623,8 @@ class TestRoundDetectionWiring:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
 
         captured: dict = {}
 
@@ -1412,6 +1685,8 @@ class TestRoundDetectionWiring:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
 
         captured: dict = {}
 
@@ -1462,6 +1737,8 @@ class TestRoundDetectionWiring:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
 
         captured: dict = {}
 
@@ -1519,6 +1796,8 @@ class TestIncrementalDiff:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
         return mock_provider
 
     @pytest.mark.asyncio

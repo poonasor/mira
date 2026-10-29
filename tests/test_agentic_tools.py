@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from mira.core.passes import agentic_review_loop
 from mira.llm.agentic_tools import (
     AGENTIC_TOOLS,
     GREP_REPO_TOOL,
@@ -132,3 +133,68 @@ class TestExecutorBudget:
         ex.bytes_used = 1_000_000  # simulate exhaustion
         out = await ex.execute("read_file", {"path": "a.py"})
         assert "budget exhausted" in out
+
+
+class TestAgenticReasoningReplay:
+    @pytest.mark.asyncio
+    async def test_preserves_reasoning_content_across_tool_turns(self):
+        class _FakeLLM:
+            def __init__(self):
+                self.calls: list[list[dict]] = []
+                self._responses = [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "I need the file.",
+                        "reasoning_items": [{"type": "reasoning", "id": "rs_1"}],
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path": "a.py"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Now I can review.",
+                        "tool_calls": [
+                            {
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_review",
+                                    "arguments": '{"comments": []}',
+                                },
+                            }
+                        ],
+                    },
+                ]
+
+            async def complete_agentic(self, messages, tools):
+                self.calls.append([dict(m) for m in messages])
+                return self._responses.pop(0)
+
+        class _Executor:
+            async def execute(self, name, args):
+                return "file contents"
+
+        llm = _FakeLLM()
+        result = await agentic_review_loop(
+            llm, [{"role": "user", "content": "review"}], _Executor()
+        )
+
+        assert result == '{"comments": []}'
+        second_turn = llm.calls[1]
+        assistant = second_turn[1]
+        assert assistant["reasoning_content"] == "I need the file."
+        assert assistant["reasoning_items"] == [{"type": "reasoning", "id": "rs_1"}]
+        assert second_turn[2] == {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "file contents",
+        }
