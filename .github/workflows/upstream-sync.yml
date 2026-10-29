@@ -1,0 +1,129 @@
+name: Upstream sync
+
+# Daily merge of miracodeai/mira main into sync/upstream, with one PR to main.
+# Never force-pushes. On conflicts it opens (or updates) one issue and stops.
+on:
+  schedule:
+    - cron: "17 10 * * *" # ~6:17 AM Toronto
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/miracodeai/mira.git
+  SYNC_BRANCH: sync/upstream
+  # Paths whose change means a human (Ricky) must review before merge.
+  SCORING_PATHS: >-
+    src/mira/core/engine.py src/mira/core/passes.py src/mira/core/ensemble.py
+    src/mira/core/noise_filter.py src/mira/core/overlap.py src/mira/core/priority.py
+    src/mira/llm/response_parser.py src/mira/llm/tool_schemas.py
+    src/mira/llm/prompts src/mira/models.py
+
+jobs:
+  sync:
+    if: github.repository == 'poonasor/mira'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+          behind=$(git rev-list --count origin/main..upstream/main)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" = "0" ]; then
+            echo "main already contains upstream/main"; echo "result=uptodate" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$SYNC_BRANCH" >/dev/null; then
+            git fetch --no-tags origin "$SYNC_BRANCH"
+            git checkout -B "$SYNC_BRANCH" "origin/$SYNC_BRANCH"
+            git merge --no-edit origin/main || { git merge --abort; echo "result=conflict" >> "$GITHUB_OUTPUT"; exit 0; }
+          else
+            git checkout -B "$SYNC_BRANCH" origin/main
+          fi
+          if ! git merge --no-edit -m "Merge miracodeai/mira main into $SYNC_BRANCH" upstream/main; then
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! git push origin "HEAD:refs/heads/$SYNC_BRANCH"; then
+            echo "Push refused (upstream may change workflow files, which GITHUB_TOKEN can't push)" > /tmp/conflicts.txt
+            echo "result=conflict" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # shellcheck disable=SC2086
+          git diff --name-only origin/main...HEAD -- $SCORING_PATHS > /tmp/scoring.txt || true
+          echo "result=merged" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update sync PR
+        if: steps.merge.outputs.result == 'merged'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.merge.outputs.behind }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated merge of [miracodeai/mira](https://github.com/miracodeai/mira) \`main\` into this fork."
+            echo
+            echo "Upstream commits not yet on \`main\`: $BEHIND. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            if [ -s /tmp/scoring.txt ]; then
+              echo
+              echo "**needs-ricky:** this sync touches scoring logic, so it must not be self-merged on Mira's score alone:"
+              sed 's/^/- `/; s/$/`/' /tmp/scoring.txt
+            fi
+          } > /tmp/body.md
+          pr=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --body-file /tmp/body.md
+          else
+            gh pr create --head "$SYNC_BRANCH" --base main \
+              --title "Sync with upstream miracodeai/mira main" --body-file /tmp/body.md
+            pr=$(gh pr list --head "$SYNC_BRANCH" --base main --state open --json number --jq '.[0].number')
+          fi
+          if [ -s /tmp/scoring.txt ]; then
+            gh label create needs-ricky --color B60205 --description "Ricky must review before merge" 2>/dev/null || true
+            gh pr edit "$pr" --add-label needs-ricky
+          fi
+          echo "Sync PR: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$pr" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report conflicts
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.merge.outputs.behind }}
+        run: |
+          set -euo pipefail
+          title="Upstream sync blocked: merge conflicts"
+          {
+            echo "The daily merge of miracodeai/mira \`main\` stopped and changed nothing. Upstream commits not on \`main\`: $BEHIND."
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Conflicting files:"
+            sed 's/^/- `/; s/$/`/' /tmp/conflicts.txt 2>/dev/null || true
+            echo
+            echo "Resolve by merging upstream into \`$SYNC_BRANCH\` by hand and pushing; the next run opens the PR."
+          } > /tmp/body.md
+          gh label create upstream-sync-conflicts --color D93F0B 2>/dev/null || true
+          issue=$(gh issue list --state open --label upstream-sync-conflicts --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body-file /tmp/body.md
+          else
+            gh issue create --title "$title" --label upstream-sync-conflicts --body-file /tmp/body.md
+            issue=$(gh issue list --state open --label upstream-sync-conflicts --json number --jq '.[0].number')
+          fi
+          echo "Conflicts notice: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues/$issue" >> "$GITHUB_STEP_SUMMARY"
