@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import tarfile
 from typing import Protocol
 from urllib.parse import quote
@@ -21,12 +22,45 @@ from mira.platforms import profiles
 
 logger = logging.getLogger(__name__)
 
+_MAX_TREE_PAGES = 1000
+
 
 class EmptyRepoError(Exception):
     """Raised when a repo has no commits/files to index (not a failure)."""
 
     def __init__(self, owner: str, repo: str) -> None:
         super().__init__(f"Repository {owner}/{repo} is empty — push code, then re-index.")
+
+
+class IncompleteTreeError(RuntimeError):
+    """Raised when a tree response cannot establish a complete file list."""
+
+
+def _tree_json(response: httpx.Response) -> object:
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise IncompleteTreeError("Invalid repository tree JSON") from exc
+
+
+def _tree_paths(entries: object) -> tuple[list[str], set[str]]:
+    if not isinstance(entries, list):
+        raise IncompleteTreeError("Invalid repository tree entries")
+    files: list[str] = []
+    paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise IncompleteTreeError("Invalid repository tree entry")
+        path = entry.get("path")
+        kind = entry.get("type")
+        if not isinstance(path, str) or not path or kind not in ("blob", "tree", "commit"):
+            raise IncompleteTreeError("Invalid repository tree entry")
+        if path in paths:
+            raise IncompleteTreeError("Duplicate repository tree entry")
+        paths.add(path)
+        if kind == "blob":
+            files.append(path)
+    return files, paths
 
 
 class RepoFetcher(Protocol):
@@ -114,26 +148,29 @@ class GitHubRepoFetcher:
             return "main"
 
     async def repo_tree(self, owner: str, repo: str, branch: str) -> list[str]:
-        url = f"{self._api}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+        url = f"{self._api}/repos/{owner}/{repo}/git/trees/{quote(branch, safe='')}?recursive=1"
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, headers=self._headers(), timeout=30)
             # GitHub returns 409 (and sometimes 404) for an empty repo.
             if resp.status_code in (404, 409):
                 raise EmptyRepoError(owner, repo)
             resp.raise_for_status()
-            data = resp.json()
-        return [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
+            data = _tree_json(resp)
+        if not isinstance(data, dict) or data.get("truncated") is not False:
+            raise IncompleteTreeError("Repository tree is incomplete")
+        paths, _ = _tree_paths(data.get("tree"))
+        return paths
 
     async def file_content(
         self, owner: str, repo: str, path: str, ref: str, semaphore=None
     ) -> str | None:
-        url = f"{self._api}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+        url = f"{self._api}/repos/{owner}/{repo}/contents/{quote(path, safe='/')}"
         headers = self._headers("application/vnd.github.raw+json")
 
         async def _fetch() -> str | None:
             try:
                 async with httpx.AsyncClient() as client:
-                    resp = await client.get(url, headers=headers, timeout=30)
+                    resp = await client.get(url, params={"ref": ref}, headers=headers, timeout=30)
                     if resp.status_code == 404:
                         return None
                     resp.raise_for_status()
@@ -155,7 +192,7 @@ class GitHubRepoFetcher:
         max_file_size: int = 1_048_576,
         indexable_paths: set[str] | None = None,
     ) -> dict[str, str] | None:
-        url = f"{self._api}/repos/{owner}/{repo}/tarball/{ref}"
+        url = f"{self._api}/repos/{owner}/{repo}/tarball/{quote(ref, safe='')}"
         headers = {**self._headers(), "User-Agent": "mira-indexer"}
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
@@ -208,33 +245,75 @@ class GitLabRepoFetcher:
 
     async def repo_tree(self, owner: str, repo: str, branch: str) -> list[str]:
         # Keyset pagination via the Link header; recursive lists the whole tree.
-        url: str | None = (
-            f"{self._project(owner, repo)}/repository/tree"
-            f"?recursive=true&per_page=100&pagination=keyset&ref={branch}"
+        initial_url = str(
+            httpx.URL(
+                f"{self._project(owner, repo)}/repository/tree",
+                params={
+                    "recursive": "true",
+                    "per_page": "100",
+                    "pagination": "keyset",
+                    "ref": branch,
+                },
+            )
         )
+        url: str | None = initial_url
         paths: list[str] = []
+        seen_urls: set[str] = set()
+        seen_paths: set[str] = set()
+        endpoint = httpx.URL(initial_url)
         async with httpx.AsyncClient() as client:
             while url:
+                if url in seen_urls:
+                    raise IncompleteTreeError("Repository tree pagination is cyclic")
+                if len(seen_urls) >= _MAX_TREE_PAGES:
+                    raise IncompleteTreeError("Repository tree page limit exceeded")
+                seen_urls.add(url)
                 resp = await client.get(url, headers=self._headers(), timeout=30)
                 # An empty repo (or a ref that doesn't exist yet) 404s.
                 if resp.status_code == 404:
                     raise EmptyRepoError(owner, repo)
                 resp.raise_for_status()
-                for item in resp.json():
-                    if item.get("type") == "blob":
-                        paths.append(item["path"])
+                files, entries = _tree_paths(_tree_json(resp))
+                if seen_paths & entries:
+                    raise IncompleteTreeError("Duplicate repository tree page entries")
+                seen_paths.update(entries)
+                paths.extend(files)
                 url = _next_link(resp.headers.get("link", ""))
+                if url:
+                    if not entries:
+                        raise IncompleteTreeError("Repository tree pagination made no progress")
+                    try:
+                        target = httpx.URL(url)
+                    except httpx.InvalidURL as exc:
+                        raise IncompleteTreeError(
+                            "Invalid repository tree pagination link"
+                        ) from exc
+                    if (target.scheme, target.host, target.port, target.path) != (
+                        endpoint.scheme,
+                        endpoint.host,
+                        endpoint.port,
+                        endpoint.path,
+                    ) or target.userinfo:
+                        raise IncompleteTreeError("Invalid repository tree pagination target")
+                    if (
+                        target.params.remove("page_token") != endpoint.params
+                        or len(target.params.get_list("page_token")) != 1
+                        or not target.params["page_token"]
+                    ):
+                        raise IncompleteTreeError("Repository tree pagination query changed")
         return paths
 
     async def file_content(
         self, owner: str, repo: str, path: str, ref: str, semaphore=None
     ) -> str | None:
-        url = f"{self._project(owner, repo)}/repository/files/{quote(path, safe='')}/raw?ref={ref}"
+        url = f"{self._project(owner, repo)}/repository/files/{quote(path, safe='')}/raw"
 
         async def _fetch() -> str | None:
             try:
                 async with httpx.AsyncClient() as client:
-                    resp = await client.get(url, headers=self._headers(), timeout=30)
+                    resp = await client.get(
+                        url, params={"ref": ref}, headers=self._headers(), timeout=30
+                    )
                     if resp.status_code == 404:
                         return None
                     resp.raise_for_status()
@@ -256,10 +335,10 @@ class GitLabRepoFetcher:
         max_file_size: int = 1_048_576,
         indexable_paths: set[str] | None = None,
     ) -> dict[str, str] | None:
-        url = f"{self._project(owner, repo)}/repository/archive.tar.gz?sha={ref}"
+        url = f"{self._project(owner, repo)}/repository/archive.tar.gz"
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
-                resp = await client.get(url, headers=self._headers())
+                resp = await client.get(url, params={"sha": ref}, headers=self._headers())
                 if resp.status_code != 200:
                     logger.warning(
                         "Tarball fetch failed for %s/%s: %d", owner, repo, resp.status_code
@@ -269,7 +348,7 @@ class GitLabRepoFetcher:
         except Exception as exc:
             logger.warning("Tarball fetch failed for %s/%s: %s", owner, repo, exc)
             return None
-        return _strip_tarball(blob, max_file_size, f"{owner}/{repo}, indexable_paths")
+        return _strip_tarball(blob, max_file_size, f"{owner}/{repo}", indexable_paths)
 
 
 class ForgejoRepoFetcher:
@@ -302,36 +381,54 @@ class ForgejoRepoFetcher:
             return "main"
 
     async def repo_tree(self, owner: str, repo: str, branch: str) -> list[str]:
-        url = f"{self._repo(owner, repo)}/git/trees/{branch}?recursive=true"
+        url = f"{self._repo(owner, repo)}/git/trees/{quote(branch, safe='')}?recursive=true&per_page=100"
         paths: list[str] = []
+        seen: set[str] = set()
+        total: int | None = None
         async with httpx.AsyncClient() as client:
-            page = 1
-            while True:
+            for page in range(1, _MAX_TREE_PAGES + 1):
                 page_url = f"{url}&page={page}" if page > 1 else url
                 resp = await client.get(page_url, headers=self._headers(), timeout=30)
                 if resp.status_code == 404:
                     raise EmptyRepoError(owner, repo)
                 resp.raise_for_status()
-                data = resp.json()
-                for item in data.get("tree") or []:
-                    if item.get("type") == "blob":
-                        paths.append(item["path"])
-                if not data.get("truncated", False):
-                    break
-                page += 1
-        return paths
+                data = _tree_json(resp)
+                if (
+                    not isinstance(data, dict)
+                    or type(data.get("total_count")) is not int
+                    or data["total_count"] < 0
+                    or type(data.get("truncated")) is not bool
+                ):
+                    raise IncompleteTreeError("Invalid repository tree pagination")
+                if total is None:
+                    total = data["total_count"]
+                elif total != data["total_count"]:
+                    raise IncompleteTreeError("Repository tree count changed during pagination")
+                files, entries = _tree_paths(data.get("tree"))
+                if seen & entries:
+                    raise IncompleteTreeError("Duplicate repository tree page entries")
+                seen.update(entries)
+                paths.extend(files)
+                # Forgejo can keep truncated=true even on the final page.
+                if len(seen) == total:
+                    return paths
+                if len(seen) > total or not entries or not data["truncated"]:
+                    raise IncompleteTreeError("Repository tree ended before its reported count")
+        raise IncompleteTreeError("Repository tree page limit exceeded")
 
     async def file_content(
         self, owner: str, repo: str, path: str, ref: str, semaphore=None
     ) -> str | None:
         import base64
 
-        url = f"{self._repo(owner, repo)}/contents/{quote(path, safe='')}?ref={ref}"
+        url = f"{self._repo(owner, repo)}/contents/{quote(path, safe='')}"
 
         async def _fetch() -> str | None:
             try:
                 async with httpx.AsyncClient() as client:
-                    resp = await client.get(url, headers=self._headers(), timeout=30)
+                    resp = await client.get(
+                        url, params={"ref": ref}, headers=self._headers(), timeout=30
+                    )
                     if resp.status_code == 404:
                         return None
                     resp.raise_for_status()
@@ -355,7 +452,7 @@ class ForgejoRepoFetcher:
         max_file_size: int = 1_048_576,
         indexable_paths: set[str] | None = None,
     ) -> dict[str, str] | None:
-        url = f"{self._repo(owner, repo)}/archive/{ref}.tar.gz"
+        url = f"{self._repo(owner, repo)}/archive/{quote(ref, safe='')}.tar.gz"
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
                 resp = await client.get(url, headers=self._headers())
@@ -368,17 +465,23 @@ class ForgejoRepoFetcher:
         except Exception as exc:
             logger.warning("Tarball fetch failed for %s/%s: %s", owner, repo, exc)
             return None
-        return _strip_tarball(blob, max_file_size, f"{owner}/{repo}, indexable_paths")
+        return _strip_tarball(blob, max_file_size, f"{owner}/{repo}", indexable_paths)
 
 
 def _next_link(link_header: str) -> str | None:
     """Extract the rel="next" URL from a Link header (GitLab keyset pagination)."""
     if not link_header:
         return None
+    next_url = None
     for part in link_header.split(","):
-        if 'rel="next"' in part:
-            return part.split(";")[0].strip().strip("<>")
-    return None
+        match = re.fullmatch(r'\s*<([^<>]+)>\s*;\s*rel=(?:"([^"]+)"|([^;\s]+))\s*', part)
+        if not match:
+            raise IncompleteTreeError("Invalid repository tree pagination link")
+        if "next" in (match[2] or match[3]).split():
+            if next_url is not None:
+                raise IncompleteTreeError("Multiple repository tree next links")
+            next_url = match[1]
+    return next_url
 
 
 def make_fetcher(platform: str, token: str) -> RepoFetcher:

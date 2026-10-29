@@ -189,23 +189,58 @@ class OpenAICompatibleProvider:
             return "auto"
         return forced_choice
 
-    def _apply_reasoning(self, body: dict) -> None:
-        """Enable extended thinking when a reasoning effort is configured.
+    def _max_tokens_field(self) -> str:
+        """Name of the Chat Completions output-token field for this profile."""
+        return self.profile.get("max_tokens_field", "max_tokens")
 
-        The effort is passed via the unified ``reasoning.effort`` knob after
-        any per-provider remap from the profile. Anthropic models reject a
-        custom ``temperature`` while thinking is on, so we drop it. Provider
-        profiles can select another wire shape: Z.AI uses a top-level
-        ``reasoning_effort`` plus ``thinking.type`` and defaults thinking on,
-        so Mira must explicitly disable it when the configured effort is off.
-        When reasoning is off, endpoints that think by default (DeepSeek) get
-        the profile's explicit disable payload instead of an omission; every
-        other endpoint stays a no-op.
+    @staticmethod
+    def _remove_reasoning(body: dict) -> None:
+        """Drop every reasoning-shaped field Mira may have added."""
+        for key in ("reasoning", "reasoning_effort", "thinking", "enable_thinking"):
+            body.pop(key, None)
+
+    @staticmethod
+    def _has_reasoning(body: dict) -> bool:
+        return any(
+            key in body for key in ("reasoning", "reasoning_effort", "thinking", "enable_thinking")
+        )
+
+    def _apply_reasoning_off(self, body: dict, protocol: str = "chat") -> None:
+        """Apply a profile's explicit "thinking off" payload, if it has one.
+
+        Chat and Responses disable thinking differently, so the Responses
+        payload is separate. Providers with no documented disable remain a
+        no-op (their default applies).
+        """
+        key = (
+            "reasoning_off_payload_responses"
+            if protocol == "responses"
+            else "reasoning_off_payload"
+        )
+        body.update(self.profile.get(key, {}))
+
+    def _apply_reasoning(self, body: dict, protocol: str = "chat") -> None:
+        """Add the provider's documented reasoning toggle and effort field.
+
+        Chat Completions uses the top-level ``reasoning_effort`` field on
+        OpenAI and most compatible endpoints; OpenRouter accepts that same
+        shorthand. Responses API uses ``reasoning.effort``. Providers that
+        need a separate toggle (DeepSeek) get it from the profile.
+
+        Anthropic-style models reject a custom ``temperature`` while thinking
+        is on, so we drop it when reasoning is applied. When reasoning is off
+        or was previously rejected for this model, the profile's explicit off
+        payload is applied instead.
+
+        Profiles with ``reasoning_style: "zai"`` (Z.AI GLM, chat only) use a
+        top-level ``reasoning_effort`` plus ``thinking.type``. Z.AI thinks by
+        default, so Mira explicitly sends ``thinking.type = disabled`` when
+        the configured effort is off or was rejected for this model.
         """
         effort = self.config.reasoning_effort
-        style = self.profile.get("reasoning_style", "nested")
-        if style == "zai":
+        if self.profile.get("reasoning_style", "nested") == "zai":
             if not effort or effort == "off" or body.get("model") in self._no_reasoning:
+                body.pop("reasoning_effort", None)
                 body["thinking"] = {"type": "disabled"}
                 return
             effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
@@ -213,30 +248,31 @@ class OpenAICompatibleProvider:
             body["reasoning_effort"] = effort
             return
 
-        if not effort or effort == "off":
-            off_payload = self.profile.get("reasoning_off_payload")
-            if off_payload:
-                body.update(off_payload)
-            return
-        if body.get("model") in self._no_reasoning:
+        if not effort or effort == "off" or body.get("model") in self._no_reasoning:
+            self._apply_reasoning_off(body, protocol)
             return
         effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
-        body["reasoning"] = {"effort": effort}
+        if protocol == "responses":
+            body["reasoning"] = {"effort": effort}
+        else:
+            body["reasoning_effort"] = effort
+            body.update(self.profile.get("reasoning_on_payload", {}))
         body.pop("temperature", None)
 
     def _reasoning_is_enabled(self, body: dict) -> bool:
-        """Whether the request body currently asks the endpoint to reason."""
+        """Whether the request body carries reasoning fields worth retrying without."""
         if self.profile.get("reasoning_style") == "zai":
             return body.get("thinking", {}).get("type") == "enabled"
-        return "reasoning" in body
+        return self._has_reasoning(body)
 
-    def _disable_reasoning(self, body: dict) -> None:
+    def _disable_reasoning(self, body: dict, protocol: str = "chat") -> None:
         """Rewrite a request body to disable its profile-specific reasoning."""
         if self.profile.get("reasoning_style") == "zai":
             body.pop("reasoning_effort", None)
             body["thinking"] = {"type": "disabled"}
             return
-        body.pop("reasoning", None)
+        self._remove_reasoning(body)
+        self._apply_reasoning_off(body, protocol)
 
     def _account_usage(self, data: dict) -> None:
         """Accumulate token counts. Default: chat/completions key names.

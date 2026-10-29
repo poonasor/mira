@@ -17,11 +17,11 @@ import logging
 import re
 from collections.abc import AsyncGenerator
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
-from mira.exceptions import ProviderError
+from mira.exceptions import ConfigError, ProviderError
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -31,7 +31,7 @@ from mira.models import (
     UnresolvedThread,
 )
 from mira.platforms import profiles
-from mira.providers.base import BaseProvider
+from mira.providers.base import CHECK_RUN_NAME, BaseProvider, CheckConclusion
 from mira.providers.formatting import format_comment_body, format_key_issues
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,21 @@ def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
     return match.group("owner"), match.group("repo"), int(match.group("number"))
 
 
+def _forgejo_web_base(api_url: str) -> str:
+    """Infer the web root only from a standard Forgejo API endpoint."""
+    try:
+        url = urlsplit(api_url)
+        if url.path.endswith("/api/v1"):
+            return urlunsplit(url._replace(path=url.path.removesuffix("/api/v1")))
+    except ValueError:
+        pass
+    raise ConfigError(
+        "Cannot infer MIRA_FORGEJO_BASE_URL from the Forgejo API URL. "
+        "Use an API URL whose path ends in /api/v1, or set "
+        "MIRA_FORGEJO_BASE_URL explicitly."
+    )
+
+
 class ForgejoProvider(BaseProvider):
     """Forgejo code hosting provider (Gitea-compatible REST API)."""
 
@@ -63,8 +78,9 @@ class ForgejoProvider(BaseProvider):
         if not token:
             raise ProviderError("Forgejo token is required")
         self._token = token
-        self._api = profiles.resolve("forgejo")["api_url"] or "https://codeberg.org/api/v1"
-        self._base = profiles.resolve("forgejo").get("base_url") or "https://codeberg.org"
+        profile = profiles.resolve("forgejo")
+        self._api = profile["api_url"] or "https://codeberg.org/api/v1"
+        self._base = profile.get("base_url") or _forgejo_web_base(self._api.rstrip("/"))
         self._username: str | None = None
 
     # ── low-level HTTP ──────────────────────────────────────────────
@@ -364,6 +380,71 @@ class ForgejoProvider(BaseProvider):
             json={"body": body},
         )
 
+    # Forgejo has no Checks API, so the commit-status model stands in for it:
+    # posting with the same context on the same SHA replaces the state, so one
+    # fixed context (``Mira``) renders a single row that transitions
+    # pending → success/failure, with the icon following the terminal state.
+    # ``start_check_run`` returns ``0`` as a "posted" sentinel —
+    # ``finish_check_run`` only skips when it gets ``None``.
+
+    async def start_check_run(
+        self,
+        pr_info: PRInfo,
+        *,
+        title: str = "",
+        summary: str = "",
+        details_url: str = "",
+    ) -> int | None:
+        """Post a ``pending`` commit status for the PR head commit."""
+        if not pr_info.head_sha:
+            return None
+        payload: dict[str, str] = {
+            "state": "pending",
+            "context": CHECK_RUN_NAME,
+            "description": summary or title,
+        }
+        if details_url:
+            payload["target_url"] = details_url
+        await self._request(
+            "POST",
+            f"{self._repo(pr_info)}/statuses/{quote(pr_info.head_sha, safe='')}",
+            json=payload,
+        )
+        return 0
+
+    async def finish_check_run(
+        self,
+        pr_info: PRInfo,
+        run_id: int | None,
+        conclusion: CheckConclusion,
+        *,
+        title: str = "",
+        summary: str = "",
+        details: str = "",
+    ) -> None:
+        """Re-post the commit status with the terminal state for its SHA.
+
+        ``details`` is accepted for interface parity with the Checks API
+        path, but commit statuses have no details area.
+        """
+        if run_id is None or not pr_info.head_sha:
+            return
+        # Forgejo's commit statuses accept success/failure/error | pending;
+        # "neutral" (completed with warnings) renders as a success.
+        state = {"success": "success", "failure": "failure", "neutral": "success"}[conclusion]
+        payload: dict[str, str] = {
+            "state": state,
+            "context": CHECK_RUN_NAME,
+            "description": summary,
+        }
+        if pr_info.url:
+            payload["target_url"] = pr_info.url
+        await self._request(
+            "POST",
+            f"{self._repo(pr_info)}/statuses/{quote(pr_info.head_sha, safe='')}",
+            json=payload,
+        )
+
     async def find_bot_comment(self, pr_info: PRInfo, marker: str) -> int | None:
         try:
             comments = await self._paginate(
@@ -537,9 +618,13 @@ class ForgejoProvider(BaseProvider):
         )
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
+        # Quoting preserves dot segments, which HTTP clients normalize to a parent resource.
+        if label in ("", ".", ".."):
+            raise ProviderError("Cannot remove an empty or dot-segment label identifier")
         await self._request(
             "DELETE",
-            f"{self._repo(pr_info)}/issues/{pr_info.number}/labels?name={quote(label, safe='')}",
+            f"{self._repo(pr_info)}/issues/{pr_info.number}/labels/{quote(label, safe='')}",
+            ok=(200, 204),
         )
 
     async def get_discussion_root_body(self, pr_info: PRInfo, discussion_id: str) -> str:

@@ -7,7 +7,8 @@ import importlib
 import os
 import time
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
+from dataclasses import replace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -615,6 +616,133 @@ class TestPostComment:
             await provider.post_comment(pr_info, "Hello")
         assert call_count == 2
         mock_issue.create_comment.assert_called_once_with("Hello")
+
+
+class TestCheckRuns:
+    @pytest.mark.asyncio
+    async def test_start_creates_in_progress_run(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+        pr_info = replace(_make_pr_info(), head_sha="deadbeef")
+
+        mock_post = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                201, json={"id": 42}, request=httpx.Request("POST", url)
+            )
+        )
+        with patch.object(httpx.AsyncClient, "post", mock_post):
+            run_id = await provider.start_check_run(
+                pr_info,
+                title="Code Review In Progress",
+                summary="Mira is analyzing your code changes…",
+                details_url=pr_info.url,
+            )
+
+        assert run_id == 42
+        args, kwargs = mock_post.call_args
+        assert args[0].endswith("/repos/o/r/check-runs")
+        body = kwargs["json"]
+        assert body["name"] == "Mira"
+        assert body["head_sha"] == "deadbeef"
+        assert body["status"] == "in_progress"
+        assert body["details_url"] == "https://github.com/o/r/pull/1"
+        assert body["output"]["title"] == "Code Review In Progress"
+        assert body["started_at"]
+        headers = kwargs["headers"]
+        assert headers["Authorization"] == "token test-token"
+        assert headers["Accept"] == "application/vnd.github+json"
+
+    @pytest.mark.asyncio
+    async def test_start_403_returns_none(self):
+        """A missing checks:write permission skips the run instead of retrying."""
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+        pr_info = replace(_make_pr_info(), head_sha="deadbeef")
+
+        mock_post = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                403,
+                text="Resource not accessible by integration",
+                request=httpx.Request("POST", url),
+            )
+        )
+        with patch.object(httpx.AsyncClient, "post", mock_post):
+            run_id = await provider.start_check_run(pr_info, title="t")
+        assert run_id is None
+
+    @pytest.mark.asyncio
+    async def test_start_no_head_sha_performs_no_call(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+        pr_info = replace(_make_pr_info(), head_sha="")
+
+        with patch.object(httpx.AsyncClient, "post") as mock_post:
+            run_id = await provider.start_check_run(pr_info)
+        assert run_id is None
+        assert mock_post.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_finish_patches_run_to_completed(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+        pr_info = replace(_make_pr_info(), head_sha="deadbeef")
+
+        mock_patch = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                200, json={"id": 42}, request=httpx.Request("PATCH", url)
+            )
+        )
+        with patch.object(httpx.AsyncClient, "patch", mock_patch):
+            await provider.finish_check_run(
+                pr_info,
+                42,
+                "success",
+                title="Code Review Complete",
+                summary="Review finished successfully.",
+                details="2 files reviewed · 1 comment",
+            )
+
+        args, kwargs = mock_patch.call_args
+        assert args[0].endswith("/repos/o/r/check-runs/42")
+        body = kwargs["json"]
+        assert body["status"] == "completed"
+        assert body["conclusion"] == "success"
+        assert body["completed_at"]
+        assert body["output"]["title"] == "Code Review Complete"
+        # The DETAILS section on GitHub is output.text.
+        assert body["output"]["text"] == "2 files reviewed · 1 comment"
+
+    @pytest.mark.asyncio
+    async def test_finish_raises_provider_error_on_404(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+        pr_info = replace(_make_pr_info(), head_sha="deadbeef")
+
+        mock_patch = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                404, text="Not Found", request=httpx.Request("PATCH", url)
+            )
+        )
+        with (
+            patch.object(httpx.AsyncClient, "patch", mock_patch),
+            pytest.raises(ProviderError, match="404"),
+        ):
+            await provider.finish_check_run(pr_info, 42, "success")
+
+    @pytest.mark.asyncio
+    async def test_finish_wraps_transport_errors(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+        pr_info = replace(_make_pr_info(), head_sha="deadbeef")
+
+        async def _boom(self, url, **kwargs):
+            raise httpx.ConnectError("connection refused")
+
+        with (
+            patch.object(httpx.AsyncClient, "patch", _boom),
+            pytest.raises(ProviderError, match="failed"),
+        ):
+            await provider.finish_check_run(pr_info, 42, "success")
 
 
 class TestFindBotComment:

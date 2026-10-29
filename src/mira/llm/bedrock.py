@@ -37,13 +37,14 @@ class _BedrockThrottlingError(Exception):
 def _openai_tool_to_bedrock(tool: dict) -> dict:
     """Convert OpenAI function-calling tool schema to Bedrock toolSpec format."""
     func = tool["function"]
-    return {
-        "toolSpec": {
-            "name": func["name"],
-            "description": func.get("description", ""),
-            "inputSchema": {"json": func["parameters"]},
-        }
+    spec: dict = {
+        "name": func["name"],
+        "inputSchema": {"json": func["parameters"]},
     }
+    # Converse rejects an empty description when the field is present.
+    if func.get("description"):
+        spec["description"] = func["description"]
+    return {"toolSpec": spec}
 
 
 def _messages_to_bedrock(messages: list[dict]) -> tuple[list[dict] | None, list[dict]]:
@@ -65,6 +66,11 @@ def _messages_to_bedrock(messages: list[dict]) -> tuple[list[dict] | None, list[
         elif role == "assistant":
             # Reconstruct assistant messages — may have tool_calls from agentic loop
             blocks: list[dict] = []
+            # Claude extended thinking requires the reasoning block and its
+            # signature to be replayed unchanged on tool turns.
+            for block in msg.get("reasoning_blocks") or []:
+                if "reasoningContent" in block:
+                    blocks.append(dict(block))
             if content:
                 blocks.append({"text": content})
             for tc in msg.get("tool_calls", []):
@@ -146,6 +152,16 @@ class BedrockProvider:
         )
         self._call_converse = self._retry(self._call_converse)
 
+    def _thinking_enabled(self) -> bool:
+        effort = self.config.reasoning_effort
+        return bool(effort and effort != "off")
+
+    def _tool_choice(self, name: str) -> dict:
+        """Thinking only supports automatic tool choice on Claude."""
+        if self._thinking_enabled():
+            return {"auto": {}}
+        return {"tool": {"name": name}}
+
     async def _call_converse(
         self,
         model: str,
@@ -174,7 +190,13 @@ class BedrockProvider:
         # unset, so drop it when enabled. Budget must stay below maxTokens.
         effort = self.config.reasoning_effort
         if effort and effort != "off":
-            budget = {"low": 2048, "medium": 8192, "high": 16384, "max": 32768}.get(effort, 8192)
+            budget = {
+                "low": 2048,
+                "medium": 8192,
+                "high": 16384,
+                "xhigh": 32768,
+                "max": 32768,
+            }.get(effort, 8192)
             budget = min(budget, max(1024, max_out - 1024))
             kwargs["additionalModelRequestFields"] = {
                 "thinking": {"type": "enabled", "budget_tokens": budget}
@@ -313,7 +335,7 @@ class BedrockProvider:
             # Force structured JSON output via tool use
             tool_config = {
                 "tools": [_JSON_RESPONSE_TOOL],
-                "toolChoice": {"tool": {"name": "submit_json_response"}},
+                "toolChoice": self._tool_choice("submit_json_response"),
             }
             response = await self._call_with_fallback(
                 messages,
@@ -344,7 +366,7 @@ class BedrockProvider:
         bedrock_tools = [_openai_tool_to_bedrock(t) for t in tools]
         tool_config = {
             "tools": bedrock_tools,
-            "toolChoice": {"tool": {"name": tools[0]["function"]["name"]}},
+            "toolChoice": self._tool_choice(tools[0]["function"]["name"]),
         }
 
         response = await self._call_with_fallback(
@@ -387,10 +409,13 @@ class BedrockProvider:
         content_blocks = message.get("content", [])
 
         openai_msg: dict = {"role": "assistant", "content": None, "tool_calls": []}
+        reasoning_blocks: list[dict] = []
 
         for block in content_blocks:
             if "text" in block:
                 openai_msg["content"] = block["text"]
+            elif "reasoningContent" in block:
+                reasoning_blocks.append(block)
             elif "toolUse" in block:
                 tool_use = block["toolUse"]
                 openai_msg["tool_calls"].append(
@@ -406,6 +431,8 @@ class BedrockProvider:
 
         if not openai_msg["tool_calls"]:
             del openai_msg["tool_calls"]
+        if reasoning_blocks:
+            openai_msg["reasoning_blocks"] = reasoning_blocks
 
         return openai_msg
 

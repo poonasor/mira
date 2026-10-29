@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+from typing import Literal
 
 from mira.models import (
     BotThreadRecord,
@@ -12,6 +13,9 @@ from mira.models import (
     ReviewResult,
     UnresolvedThread,
 )
+
+CheckConclusion = Literal["success", "failure", "neutral"]
+CHECK_RUN_NAME = "Mira"
 
 
 class BaseProvider(abc.ABC):
@@ -83,6 +87,42 @@ class BaseProvider(abc.ABC):
 
     async def update_pr_description(self, pr_info: PRInfo, body: str) -> None:
         """Replace the PR/MR description body. No-op default; providers override."""
+        return
+
+    async def start_check_run(
+        self,
+        pr_info: PRInfo,
+        *,
+        title: str = "",
+        summary: str = "",
+        details_url: str = "",
+    ) -> int | None:
+        """Start a check run (or, where the platform has no Checks API,
+        post a ``pending`` commit status) for the PR head commit.
+
+        Returns a run handle for :meth:`finish_check_run`, or ``None`` when
+        nothing was published (e.g. no head SHA, or the token lacks permission
+        and the provider degrades to ``None``). Providers MAY raise
+        ``ProviderError`` on other failures; callers in the engine treat the
+        whole call as best-effort.
+        """
+        return None
+
+    async def finish_check_run(
+        self,
+        pr_info: PRInfo,
+        run_id: int | None,
+        conclusion: CheckConclusion,
+        *,
+        title: str = "",
+        summary: str = "",
+        details: str = "",
+    ) -> None:
+        """Finish a check run with a conclusion (success/failure/neutral).
+
+        ``details`` is the expanded detail text (e.g. review stats); platforms
+        without an expandable details area (Forgejo commit statuses) ignore it.
+        """
         return
 
     async def add_label(self, pr_info: PRInfo, label: str) -> None:

@@ -99,13 +99,25 @@ async def agentic_review_loop(
             )
             return ""
 
-        convo.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            }
-        )
+        assistant_message = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls,
+        }
+        # Providers that think with tools require their reasoning payload to be
+        # replayed unchanged on the next turn (DeepSeek, MiniMax, OpenRouter,
+        # Responses reasoning items, Bedrock reasoningContent blocks).
+        for key in (
+            "reasoning_content",
+            "reasoning",
+            "reasoning_details",
+            "reasoning_items",
+            "reasoning_blocks",
+        ):
+            value = msg.get(key)
+            if value:
+                assistant_message[key] = value
+        convo.append(assistant_message)
 
         for call in tool_calls:
             fn = call.get("function") or {}

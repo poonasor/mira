@@ -6,6 +6,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **PR reviews publish a check run on the head commit**, so the PR and checks pages show a live status row: in progress while the review runs, success/failure on completion (neutral on GitHub when the walkthrough summary was not generated). GitHub uses the Checks API; Forgejo — which has no Checks API — adapts the lifecycle onto commit statuses with a single fixed context that is replaced in place per SHA (its statuses have no neutral state, so a neutral conclusion displays as success). The completed run's expandable details section shows the review stats (files reviewed, comment count with the severity breakdown) so the status row is informative without opening the walkthrough comment.
+
+### Changed
+
+- **GitHub App permission: `checks: read & write`** (newly required; earlier releases needed no check permission). Existing installations must add the permission to see review status updates; a missing permission is logged and the review proceeds without the status.
+
+## [0.10.1] — 2026-10-28
+
+### Fixed
+
+- **Dashboard charts include the complete review history.** Time-series metrics no longer stop at the newest 500 reviews per repository, so older dates, categories, and totals remain visible.
+- **Activity search finds older reviews.** Search scans persisted history before applying the 500-match limit per repository; the unfiltered recent-activity feed is unchanged.
+- **SQLite vulnerability summaries report persisted alerts.** Organization-wide severity counts now include alerts from repository databases, matching the vulnerability listing.
+- **Invalid walkthroughs are retried once.** Empty summaries and leaked tool-call XML are rejected; if the retry also fails, the PR placeholder reports that the walkthrough could not be generated.
+- **Repository file requests preserve refs and paths.** GitHub, GitLab, and Forgejo correctly encode refs containing query delimiters or literal percent sequences, and GitHub content paths preserve filename delimiters.
+- **Repository tree requests preserve branch names.** GitHub, GitLab, and Forgejo correctly encode refs containing slashes, query delimiters, or literal percent sequences so indexing reads the intended tree.
+- **Repository archive requests preserve refs.** Tarball downloads on GitHub, GitLab, and Forgejo correctly encode branch and tag refs instead of treating special characters as URL paths, queries, or fragments.
+- **GitLab and Forgejo archive fetches honor path filters.** Excluded files are discarded during tarball extraction instead of being decoded and retained in memory.
+- **Incomplete repository trees are rejected.** Truncated GitHub trees and incomplete GitLab or Forgejo pagination no longer silently produce partial indexes.
+- **PR vulnerability scans preserve package identity and comment origins.** Internal ecosystem kinds remain intact, findings use the matching manifest location, and repeated occurrences of the same package and version produce one OSV query and finding per scan.
+- **LLM requests follow provider-specific reasoning and token settings.** Chat and Responses requests use the appropriate reasoning controls and output-token fields, including compatible-provider fallbacks.
+- **Agentic tool turns retain reasoning context.** Chat and Responses conversations preserve reasoning data and tool-call identifiers across turns.
+- **Bedrock thinking and tools use compatible request shapes.** Thinking settings, forced tool choice, and tool specifications now follow model requirements.
+- **Codex CLI receives the configured reasoning effort.** Review invocations now pass the selected reasoning setting to the CLI.
+
 ## [0.10.0] — 2026-10-26
 
 ### Security
@@ -354,6 +381,7 @@ Initial public release.
 - `handle_push_index` now updates `updated_at` after incremental re-indexing
   so the "Indexed X ago" timestamp tracks reality.
 
+[0.10.1]: https://github.com/miracodeai/mira/releases/tag/v0.10.1
 [0.10.0]: https://github.com/miracodeai/mira/releases/tag/v0.10.0
 [0.9.1]: https://github.com/miracodeai/mira/releases/tag/v0.9.1
 [0.6.0]: https://github.com/miracodeai/mira/releases/tag/v0.6.0

@@ -461,6 +461,14 @@ def parse_walkthrough_response(raw_text: str) -> LLMWalkthroughResponse:
 
     data = _unstring_nested_json(data)
 
+    # An empty/mis-shaped tool response otherwise validates using every field's
+    # default and gets posted as a successful walkthrough with only stats.
+    summary = data.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ResponseParseError("Walkthrough response must contain a non-empty summary")
+    if re.search(r"</?(?:invoke|function_calls|parameter|arg_key|arg_value)\b", summary):
+        raise ResponseParseError("Walkthrough summary contains leaked tool-call XML")
+
     # Rebuild any fields that arrived as leaked XML fragments (issue #162)
     for key, model in _WALKTHROUGH_FIELD_MODELS.items():
         value = data.get(key)

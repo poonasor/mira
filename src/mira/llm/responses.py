@@ -52,19 +52,28 @@ def _responses_input(messages: list[dict]) -> list[dict]:
         if role == "assistant":
             content = msg.get("content")
             tool_calls = msg.get("tool_calls") or []
-            if not content and not tool_calls:
+            reasoning_items = msg.get("reasoning_items") or []
+            if not content and not tool_calls and not reasoning_items:
                 continue  # skip empty assistant
+            # Replay the provider's reasoning items before the assistant text
+            # and function calls. OpenAI uses this for encrypted reasoning;
+            # DeepSeek merges reasoning input items into the adjacent message.
+            for item in reasoning_items:
+                items.append(dict(item))
             if content:
                 items.append({"type": "message", "role": "assistant", "content": content})
             for tc in tool_calls:
                 args = tc.get("function", {}).get("arguments", "{}")
                 if isinstance(args, dict):
                     args = json.dumps(args)
+                call_id = tc.get("id", "")
                 items.append(
                     {
                         "type": "function_call",
-                        "id": tc.get("id", ""),
-                        "call_id": tc.get("id", ""),
+                        # ``id`` identifies the output item; ``call_id`` pairs
+                        # the call with its function_call_output.
+                        "id": tc.get("provider_id") or call_id,
+                        "call_id": call_id,
                         "name": tc.get("function", {}).get("name", ""),
                         "arguments": args,
                     }
@@ -125,6 +134,7 @@ def _response_message(data: dict) -> dict:
     output = data.get("output", [])
     text_parts: list[str] = []
     tool_calls: list[dict] = []
+    reasoning_items: list[dict] = []
 
     for item in output:
         itype = item.get("type", "")
@@ -134,6 +144,10 @@ def _response_message(data: dict) -> dict:
                 for part in content:
                     if part.get("type") in ("output_text", "text"):
                         text_parts.append(part.get("text", ""))
+        elif itype == "reasoning":
+            # Keep the provider's item intact (encrypted content, signature,
+            # summary, or plain reasoning text) so it can be replayed.
+            reasoning_items.append(dict(item))
         elif itype == "function_call":
             # In Responses API, name/arguments are direct on the item
             name = item.get("name", "")
@@ -142,13 +156,17 @@ def _response_message(data: dict) -> dict:
             tool_calls.append(
                 {
                     "id": call_id,
+                    "provider_id": item.get("id", ""),
                     "type": "function",
                     "function": {"name": name, "arguments": arguments},
                 }
             )
 
     content = "".join(text_parts) if text_parts else (None if tool_calls else "")
-    return {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    if reasoning_items:
+        message["reasoning_items"] = reasoning_items
+    return message
 
 
 # ── Provider class ──────────────────────────────────────────────────
@@ -170,6 +188,9 @@ class ResponsesProvider(OpenAICompatibleProvider):
         self._url = f"{config.base_url.rstrip('/')}/responses"
 
     # ── Overrides ────────────────────────────────────────────────────
+
+    def _apply_reasoning(self, body: dict, protocol: str = "responses") -> None:
+        super()._apply_reasoning(body, protocol=protocol)
 
     def _account_usage(self, data: dict) -> None:
         """Accumulate token counts from Responses API usage.
@@ -202,7 +223,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
         if json_mode:
             body["text"] = {"format": {"type": "json_object"}}
             body["input"] = _ensure_json_hint(body["input"])
-        self._apply_reasoning(body)
+        self._apply_reasoning(body, protocol="responses")
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(
@@ -243,7 +264,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }
-        self._apply_reasoning(body)
+        self._apply_reasoning(body, protocol="responses")
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(
@@ -267,7 +288,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             ):
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                self._disable_reasoning(body)
+                self._disable_reasoning(body, protocol="responses")
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
@@ -331,7 +352,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }
-        self._apply_reasoning(body)
+        self._apply_reasoning(body, protocol="responses")
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(
@@ -347,7 +368,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 api_model = _strip_model_prefix(model, self.config.base_url)
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                self._disable_reasoning(body)
+                self._disable_reasoning(body, protocol="responses")
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
