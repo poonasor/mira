@@ -23,6 +23,7 @@ from mira.models import (
 from mira.platforms.handlers import review_completed_payload
 from mira.providers.forgejo import ForgejoProvider
 from mira.providers.github import GitHubProvider
+from mira.providers.origin import OriginProvider
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 NEWER_SHA = "fedcba9876543210fedcba9876543210fedcba98"
@@ -282,6 +283,98 @@ async def test_forgejo_zero_findings_submits_scored_review():
     assert body["commit_id"] == SHA
     assert body["comments"] == []
     assert SCORE_MARKER in body["body"]
+
+
+# ── Origin provider ─────────────────────────────────────────────────
+
+
+def _origin() -> OriginProvider:
+    provider = OriginProvider("tok")
+    resp = MagicMock()
+    resp.json.return_value = {"comments": [{"id": "cmt_1"}]}
+    provider._request = AsyncMock(return_value=resp)  # type: ignore[method-assign]
+    return provider
+
+
+@pytest.mark.asyncio
+async def test_origin_findings_review_ends_with_score_line_and_marker():
+    provider = _origin()
+
+    await provider.post_review(_pr_info(platform="origin"), _scored([_comment()]))
+
+    provider._request.assert_awaited_once()
+    method, url = provider._request.await_args.args
+    body = provider._request.await_args.kwargs["json"]
+    assert (method, url.endswith("/reviews")) == ("POST", True)
+    assert len(body["comments"]) == 1
+    assert "Mira Review Summary" in body["body"]
+    assert body["body"].splitlines()[-2:] == [SCORE_LINE, SCORE_MARKER]
+
+
+@pytest.mark.asyncio
+async def test_origin_zero_findings_submits_scored_review():
+    provider = _origin()
+
+    await provider.post_review(_pr_info(platform="origin"), _scored([]))
+
+    provider._request.assert_awaited_once()
+    body = provider._request.await_args.kwargs["json"]
+    assert body["verdict"] == "comment"
+    assert body["comments"] == []
+    assert body["body"].splitlines()[-2:] == [SCORE_LINE, SCORE_MARKER]
+
+
+@pytest.mark.asyncio
+async def test_origin_unknown_head_posts_nothing_for_zero_findings():
+    provider = _origin()
+
+    assert await provider.post_review(_pr_info(platform="origin"), _scored([], head_sha="")) == []
+    provider._request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_origin_clamped_score_matches_walkthrough_and_review():
+    """A blocker clamps the score before both the walkthrough and the review use it."""
+    blocker = json.dumps(
+        {
+            "comments": [
+                {
+                    "path": "src/utils.py",
+                    "line": 2,
+                    "severity": "blocker",
+                    "category": "bug",
+                    "title": "Broken",
+                    "body": "Wrong result.",
+                    "confidence": 0.95,
+                }
+            ],
+            "summary": "Found a blocker.",
+            "metadata": {"reviewed_files": 1},
+        }
+    )
+    llm = _clean_llm()
+    llm.review = AsyncMock(return_value=blocker)
+    llm.complete = AsyncMock(return_value=blocker)
+    provider = _provider(_pr_info(platform="origin"))
+    engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=provider)
+
+    result = await engine.review_pr("https://cursor.com/codebase/test/repo/pull/1")
+
+    assert result.confidence_score == 2
+    bodies = [c.args[1] for c in provider.post_comment.await_args_list]
+    bodies += [c.args[2] for c in provider.update_comment.await_args_list]
+    walkthroughs = [b for b in bodies if "Confidence:" in b]
+    assert walkthroughs and "Confidence: 2/5" in walkthroughs[-1]
+    posted = provider.post_review.await_args.args[1]
+    assert posted.confidence_score == 2
+
+    origin = _origin()
+    await origin.post_review(_pr_info(platform="origin"), posted)
+    body = origin._request.await_args.kwargs["json"]["body"]
+    assert body.splitlines()[-2:] == [
+        f"Confidence: 2/5 \u00b7 head {SHA}",
+        f"<!-- mira-score sha={SHA} score=2 -->",
+    ]
 
 
 # ── review.completed payload ────────────────────────────────────────
