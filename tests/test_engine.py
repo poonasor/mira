@@ -566,18 +566,63 @@ class TestReviewEngine:
         assert wt.confidence_score.score == 3
         assert wt.confidence_score.label == "Needs review"
 
-    def test_clamp_does_not_raise_score(self):
+    @pytest.mark.parametrize("initial", [1, 2, 3])
+    def test_clamp_raises_clean_review_to_four(self, initial):
         wt = WalkthroughResult(
             confidence_score=WalkthroughConfidenceScore(
-                score=1,
-                label="Major concerns",
+                score=initial,
+                label="Safe to merge",
                 reason="existing",
             ),
         )
         _clamp_confidence_to_findings(wt, [])
-        # No findings and LLM already scored low → leave as-is.
+        assert wt.confidence_score.score == 4
+        assert wt.confidence_score.label == "Safe to merge"
+        assert wt.confidence_score.reason == "Review found no blockers or warnings."
+
+    def test_clamp_raises_when_only_suggestions_and_nitpicks(self):
+        wt = WalkthroughResult(
+            confidence_score=WalkthroughConfidenceScore(score=3, label="Minor", reason="r"),
+        )
+        _clamp_confidence_to_findings(
+            wt, [self._comment(Severity.SUGGESTION), self._comment(Severity.NITPICK)]
+        )
+        assert wt.confidence_score.score == 4
+
+    @pytest.mark.parametrize("severity", [Severity.WARNING, Severity.BLOCKER])
+    def test_clamp_no_raise_with_any_warning_or_blocker(self, severity):
+        wt = WalkthroughResult(
+            confidence_score=WalkthroughConfidenceScore(
+                score=2 if severity == Severity.BLOCKER else 3,
+                label="Needs review",
+                reason="original",
+            ),
+        )
+        _clamp_confidence_to_findings(wt, [self._comment(severity)])
+        assert wt.confidence_score.score == (2 if severity == Severity.BLOCKER else 3)
+        assert wt.confidence_score.label == "Needs review"
+        assert wt.confidence_score.reason == "original"
+
+    def test_clamp_no_raise_with_one_warning_low_score(self):
+        wt = WalkthroughResult(
+            confidence_score=WalkthroughConfidenceScore(score=1, label="Major", reason="r"),
+        )
+        _clamp_confidence_to_findings(wt, [self._comment(Severity.WARNING)])
         assert wt.confidence_score.score == 1
-        assert wt.confidence_score.label == "Major concerns"
+
+    @pytest.mark.parametrize("initial", [4, 5])
+    def test_clamp_clean_review_leaves_four_or_higher_alone(self, initial):
+        wt = WalkthroughResult(
+            confidence_score=WalkthroughConfidenceScore(
+                score=initial,
+                label="LLM label",
+                reason="LLM reason",
+            ),
+        )
+        _clamp_confidence_to_findings(wt, [])
+        assert wt.confidence_score.score == initial
+        assert wt.confidence_score.label == "LLM label"
+        assert wt.confidence_score.reason == "LLM reason"
 
     def test_clamp_blocker_beats_warnings(self):
         wt = WalkthroughResult(

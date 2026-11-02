@@ -163,15 +163,17 @@ def _clamp_confidence_to_findings(
     walkthrough: WalkthroughResult,
     comments: list[ReviewComment],
 ) -> None:
-    """Tighten the walkthrough confidence score based on actual review findings.
+    """Reconcile the walkthrough confidence score with actual review findings.
 
     The LLM rates confidence before chunked review runs, so it hasn't yet seen
-    blockers or warnings discovered later. This never *raises* the score — it
-    only lowers it when the findings contradict an optimistic initial read.
+    what the review finds. Findings that contradict an optimistic initial read
+    lower the score; a review that finds nothing to fix lifts a pessimistic
+    one to the "safe" band.
 
     Rubric (1=major concerns, 5=safe to merge):
       - ≥1 blocker → score ≤ 2
       - ≥3 warnings (and no blocker) → score ≤ 3
+      - 0 blockers and 0 warnings → score ≥ 4
     """
     cs = walkthrough.confidence_score
     if cs is None:
@@ -192,10 +194,14 @@ def _clamp_confidence_to_findings(
         cs.score = 3
         cs.label = "Needs review"
         cs.reason = f"Found {warnings} warnings that need attention before merge."
+    elif blockers == 0 and warnings == 0 and cs.score < 4:
+        cs.score = 4
+        cs.label = "Safe to merge"
+        cs.reason = "Review found no blockers or warnings."
 
     if cs.score != original:
         logger.info(
-            "Clamped walkthrough confidence from %d to %d (%d blocker(s), %d warning(s))",
+            "Adjusted walkthrough confidence from %d to %d (%d blocker(s), %d warning(s))",
             original,
             cs.score,
             blockers,
