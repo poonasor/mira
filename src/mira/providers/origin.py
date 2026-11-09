@@ -82,39 +82,65 @@ def _ref_branch(ref: str) -> str:
     return ref
 
 
+def _file_section(f: dict[str, Any]) -> list[str]:
+    """One file's git-style diff section, as lines with no trailing blank.
+
+    An empty ``patch`` gets the extended git header alone. A bare header pair
+    followed by a blank line is not valid; unidiff rejects it with
+    "Unexpected trailing newline character" as soon as another file follows.
+    """
+    filename = f.get("filename") or ""
+    previous = f.get("previousFilename") or ""
+    status = f.get("status") or "modified"
+    patch = (f.get("patch") or "").removesuffix("\n")
+
+    if status in ("renamed", "copied") and previous and previous != filename:
+        verb = "rename" if status == "renamed" else "copy"
+        lines = [
+            f"diff --git a/{previous} b/{filename}",
+            f"{verb} from {previous}",
+            f"{verb} to {filename}",
+        ]
+        old, new_path = f"a/{previous}", f"b/{filename}"
+    elif status == "added":
+        lines = [f"diff --git a/{filename} b/{filename}", "new file mode 100644"]
+        old, new_path = "/dev/null", f"b/{filename}"
+    elif status == "removed":
+        lines = [f"diff --git a/{filename} b/{filename}", "deleted file mode 100644"]
+        old, new_path = f"a/{filename}", "/dev/null"
+    else:
+        lines = [f"diff --git a/{filename} b/{filename}"]
+        old, new_path = f"a/{filename}", f"b/{filename}"
+
+    if patch:
+        lines += [f"--- {old}", f"+++ {new_path}", patch]
+    return lines
+
+
+def _missing_patch_paths(files: list[dict[str, Any]]) -> list[str]:
+    """Changed files that came back with no ``patch``."""
+    missing: list[str] = []
+    for f in files:
+        name = f.get("filename") or ""
+        if not name or f.get("patch"):
+            continue
+        status = f.get("status") or "modified"
+        counts = [f.get(k) for k in ("additions", "deletions") if isinstance(f.get(k), int)]
+        if counts:
+            if sum(counts) > 0:
+                missing.append(name)
+        elif status not in ("removed", "renamed", "copied"):
+            missing.append(name)
+    return missing
+
+
 def _patches_to_diff(files: list[dict[str, Any]]) -> str:
     """Rebuild a unified diff from Origin per-file ``patch`` fields."""
-    chunks: list[str] = []
+    lines: list[str] = []
     for f in files:
-        filename = f.get("filename") or ""
-        previous = f.get("previousFilename") or ""
-        status = f.get("status") or "modified"
-        patch = f.get("patch") or ""
-        if not filename:
-            continue
-        if status == "added":
-            chunks.append(f"diff --git a/{filename} b/{filename}")
-            chunks.append("new file mode 100644")
-            chunks.append("--- /dev/null")
-            chunks.append(f"+++ b/{filename}")
-        elif status == "removed":
-            chunks.append(f"diff --git a/{filename} b/{filename}")
-            chunks.append("deleted file mode 100644")
-            chunks.append(f"--- a/{filename}")
-            chunks.append("+++ /dev/null")
-        elif status in ("renamed", "copied") and previous:
-            chunks.append(f"diff --git a/{previous} b/{filename}")
-            chunks.append(f"--- a/{previous}")
-            chunks.append(f"+++ b/{filename}")
-        else:
-            chunks.append(f"diff --git a/{filename} b/{filename}")
-            chunks.append(f"--- a/{filename}")
-            chunks.append(f"+++ b/{filename}")
-        if patch:
-            chunks.append(patch if patch.endswith("\n") else patch + "\n")
-        else:
-            chunks.append("")
-    return "\n".join(chunks).rstrip() + ("\n" if chunks else "")
+        if f.get("filename"):
+            lines += _file_section(f)
+    return "\n".join(lines) + "\n" if lines else ""
 
 
 class OriginProvider(BaseProvider):
@@ -146,6 +172,7 @@ class OriginProvider(BaseProvider):
         self._id_to_int: dict[str, int] = {}
         self._int_to_id: dict[int, str] = {}
         self._next_id = 1
+        self.missing_patch_paths: list[str] = []
 
     def _intern(self, sid: str) -> int:
         if sid in self._id_to_int:
@@ -285,6 +312,15 @@ class OriginProvider(BaseProvider):
             raise
         except Exception as e:
             raise ProviderError(f"Failed to fetch Origin PR diff: {e}") from e
+        self.missing_patch_paths = _missing_patch_paths(files)
+        if self.missing_patch_paths:
+            logger.warning(
+                "Origin returned %d of %d changed file(s) without a patch for %s: %s",
+                len(self.missing_patch_paths),
+                len(files),
+                pr_info.url,
+                ", ".join(self.missing_patch_paths[:10]),
+            )
         return _patches_to_diff(files)
 
     async def get_compare_diff(self, pr_info: PRInfo, base_sha: str, head_sha: str) -> str:
