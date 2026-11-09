@@ -901,10 +901,10 @@ class TestMalformedToolArguments:
     @pytest.mark.asyncio
     async def test_corrupted_arguments_raise(self, config: LLMConfig):
         provider = ResponsesProvider(config)
-        corrupt = _make_resp_tool(
-            "submit_review",
-            '{"summary": "still unverified.},"effort":"{}',
-        )
+        # Genuinely unrecoverable under upstream's recovery (brace-balancing
+        # fixes plain truncations): a stray quote inside a string value, the
+        # same glm quote/brace glitch family as before.
+        corrupt = _make_resp_tool("submit_review", '{"summary": "still unverified."extra"}')
         mock_client = _mock_client(None, extra_posts=[_mock_httpx_response(corrupt, 200)])
 
         with (
