@@ -303,7 +303,10 @@ class TestComplete:
             assert "temperature" not in body
 
     @pytest.mark.asyncio
-    async def test_reasoning_off_leaves_body_unchanged(self):
+    async def test_reasoning_off_sends_no_effort_and_keeps_temperature(self):
+        # The default endpoint is OpenRouter, where "off" is an explicit
+        # ``reasoning: {"enabled": false}`` because thinking models think by
+        # default there; the effort field itself is never sent.
         for effort in (None, "off"):
             config = LLMConfig(model="test-model", reasoning_effort=effort)
             provider = LLMProvider(config)
@@ -321,7 +324,8 @@ class TestComplete:
 
                 call_kwargs = mock_client.post.call_args
                 body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
-                assert "reasoning" not in body
+                assert "reasoning_effort" not in body
+                assert body["reasoning"] == {"enabled": False}
                 assert "temperature" in body
 
     @pytest.mark.asyncio
@@ -404,8 +408,8 @@ class TestComplete:
                 await provider.complete([{"role": "user", "content": "hi"}])
 
     @pytest.mark.asyncio
-    async def test_empty_content_returns_empty_string(self):
-        config = LLMConfig(model="test-model")
+    async def test_empty_content_raises_after_retries(self):
+        config = LLMConfig(model="test-model", max_retries=2, retry_min_wait=0, retry_max_wait=0)
         provider = LLMProvider(config)
 
         resp_data = {"choices": [{"message": {"content": None}}]}
@@ -418,9 +422,13 @@ class TestComplete:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
-            result = await provider.complete([{"role": "user", "content": "hi"}])
+            with pytest.raises(LLMError) as error:
+                await provider.complete([{"role": "user", "content": "hi"}])
 
-        assert result == ""
+        assert error.value.code == "completion_failed"
+        assert isinstance(error.value.__cause__, LLMError)
+        assert error.value.__cause__.code == "empty_response"
+        assert mock_client.post.await_count == 2
 
     @pytest.mark.asyncio
     async def test_config_timeout_passed_to_httpx(self):
@@ -1120,7 +1128,9 @@ class TestResponseDiagnostics:
     @pytest.mark.asyncio
     async def test_empty_response_reports_finish_reason_and_usage(self):
         # max_retries=1: no_tool_call is retriable, so keep the test to one call.
-        provider = LLMProvider(LLMConfig(model="m", max_retries=1))
+        # max_tokens=4096: below the retry budget, so the cut-off reply is
+        # retried once with the larger one and the diagnostic is still carried.
+        provider = LLMProvider(LLMConfig(model="m", max_retries=1, max_tokens=4096))
         empty = _mock_httpx_response(
             {
                 "choices": [
@@ -1145,11 +1155,15 @@ class TestResponseDiagnostics:
             patch("mira.llm.provider.httpx.AsyncClient") as cls,
             pytest.raises(LLMError) as excinfo,
         ):
-            cls.return_value = self._client([empty])
+            # A reply cut off at the budget is retried once with a larger one;
+            # the model exhausts that too, and the diagnostic is still carried.
+            client = self._client([empty, empty])
+            cls.return_value = client
             await provider.complete_with_tools(
                 [{"role": "user", "content": "hi"}], tools=[self._TOOL]
             )
 
+        assert client.post.await_count == 2
         message = str(excinfo.value)
         assert "finish_reason=length" in message
         assert "reasoning_len=50" in message

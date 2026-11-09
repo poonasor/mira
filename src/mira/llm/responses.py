@@ -15,7 +15,7 @@ from typing import ClassVar
 import httpx
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
+from mira.exceptions import LLMError, NonRetriableLLMError, StructuredOutputError
 from mira.llm.base import OpenAICompatibleProvider, _strip_model_prefix
 from mira.llm.response_parser import validate_tool_arguments
 from mira.llm.utils import _ensure_json_hint
@@ -166,6 +166,9 @@ def _response_message(data: dict) -> dict:
     message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
     if reasoning_items:
         message["reasoning_items"] = reasoning_items
+    finish_reason = data.get("status") or (data.get("incomplete_details") or {}).get("reason")
+    if finish_reason:
+        message["finish_reason"] = finish_reason
     return message
 
 
@@ -235,7 +238,39 @@ class ResponsesProvider(OpenAICompatibleProvider):
             data = resp.json()
 
         self._account_usage(data)
-        return _output_text(data)
+        text = _output_text(data) or ""
+        if not text.strip():
+            refused = any(
+                item.get("type") == "message"
+                and item.get("role") == "assistant"
+                and isinstance(item.get("content"), list)
+                and any(
+                    isinstance(part, dict) and part.get("type") == "refusal"
+                    for part in item["content"]
+                )
+                for item in data.get("output") or []
+            )
+            filtered = (
+                data.get("status") == "incomplete"
+                and (data.get("incomplete_details") or {}).get("reason") == "content_filter"
+            )
+            if refused or filtered:
+                raise NonRetriableLLMError("completion_blocked", protocol="responses")
+            response_status = data.get("status")
+            if response_status not in (
+                "completed",
+                "incomplete",
+                "failed",
+                "in_progress",
+                "queued",
+                "cancelled",
+            ):
+                response_status = "other"
+            raise LLMError(
+                "empty_response",
+                detail=f"protocol=responses status={resp.status_code} response_status={response_status} content_len={len(text)}",
+            )
+        return text
 
     async def _call_llm_with_tools(
         self,
@@ -243,18 +278,21 @@ class ResponsesProvider(OpenAICompatibleProvider):
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
         """Make an LLM call with tool/function calling and retries.
 
         The LLM returns structured data by 'calling' a tool. We extract the
-        tool arguments as the JSON response.
+        tool arguments as the JSON response. ``force_tool`` forces a named
+        tool and rejects prose with ``StructuredOutputError``.
         """
         api_model = _strip_model_prefix(model, self.config.base_url)
         if not tools:
             raise LLMError("no_tools")
+        forced_tool_name = force_tool or tools[0]["function"]["name"]
         forced_choice: dict | str = {
             "type": "function",
-            "name": tools[0]["function"]["name"],
+            "name": forced_tool_name,
         }
         body: dict = {
             "model": api_model,
@@ -286,9 +324,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 and self._reasoning_is_enabled(body)
                 and any(term in resp.text.lower() for term in ("reasoning", "thinking"))
             ):
-                logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
-                self._no_reasoning.add(api_model)
-                self._disable_reasoning(body, protocol="responses")
+                self._drop_rejected_reasoning(body, api_model, protocol="responses")
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
@@ -300,6 +336,19 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
         # Check for tool calls in the response
         output = data.get("output", [])
+        if force_tool:
+            for item in output:
+                if item.get("type") == "function_call" and item.get("name") == force_tool:
+                    return item.get("arguments") or "{}"
+            text = _output_text(data)
+            excerpt = " ".join(text.split())[:300]
+            raise StructuredOutputError(
+                "structured_output",
+                model=api_model,
+                tool=force_tool,
+                excerpt=excerpt or "(empty response)",
+            )
+
         for item in output:
             if item.get("type") == "function_call":
                 arguments = item.get("arguments") or "{}"
@@ -366,9 +415,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 and any(term in resp.text.lower() for term in ("reasoning", "thinking"))
             ):
                 api_model = _strip_model_prefix(model, self.config.base_url)
-                logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
-                self._no_reasoning.add(api_model)
-                self._disable_reasoning(body, protocol="responses")
+                self._drop_rejected_reasoning(body, api_model, protocol="responses")
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
