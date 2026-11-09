@@ -114,7 +114,10 @@ class TestLlmConfigForFailover:
         assert config.reasoning_effort == "high"
         assert config.failover is not None
         assert config.failover.model == "opus"
-        assert config.failover.reasoning_effort is None
+        # Upstream applies DEFAULT_REVIEW_REASONING_EFFORT ('medium') to the
+        # failover tier; the isolation property is that it must NOT inherit the
+        # dashboard's review override ('high').
+        assert config.failover.reasoning_effort == "medium"
 
     def test_failover_resolves_its_own_indexing_model(self):
         base = LLMConfig(

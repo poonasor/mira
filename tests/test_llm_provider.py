@@ -710,7 +710,11 @@ class TestZAIProfile:
         assert result == {"content": "done"}
         assert bodies[0]["thinking"] == {"type": "enabled"}
         assert bodies[0]["reasoning_effort"] == "max"
-        assert bodies[1]["thinking"] == {"type": "disabled"}
+        assert bodies[1]["model"] == "glm-5.2"
+        # Upstream _drop_rejected_reasoning strips the reasoning fields; Z.AI's
+        # profile has no reasoning_off_payload, so the retry omits them entirely
+        # instead of the fork's thinking={"type": "disabled"} body mutation.
+        assert "thinking" not in bodies[1]
         assert "reasoning_effort" not in bodies[1]
         assert "glm-5.2" in provider._no_reasoning
 
@@ -878,10 +882,11 @@ class TestMalformedToolArguments:
     # emitted `unverified.},"effort":{"}` where `unverified.", "effort": {}`
     # was intended — the closing quote became a brace and a stray quote landed
     # inside the braces.
-    _CORRUPT = (
-        '{"change_groups":[{"files": [{"change_type": "modified", '
-        '"description": "still unverified.},"effort":{}", "path": "a.tsx"}]}]}'
-    )
+    # Genuinely unrecoverable under upstream's recovery (loads_lenient's
+    # brace-balancing fixes plain truncations): a stray quote inside a string
+    # value — the same glm quote/brace glitch family — that no repair pass can
+    # fix and that _first_json_value cannot salvage.
+    _CORRUPT = '{"change_type": "modified", "description": "still unverified."extra"}'
 
     @pytest.mark.asyncio
     async def test_corrupted_arguments_raise_malformed_error(self):

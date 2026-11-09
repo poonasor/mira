@@ -1666,10 +1666,6 @@ class TestThreadResolution:
         )
 
         llm = MagicMock(spec=LLMProvider)
-
-        # No tool calls: the agentic loop exits and the forced review runs.
-
-        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1700,8 +1696,6 @@ class TestThreadResolution:
     ):
         """With auto_resolve_conversations off, no threads are fetched or resolved."""
         llm = MagicMock(spec=LLMProvider)
-        # No tool calls: the agentic loop exits and the forced review runs.
-        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         llm.complete = AsyncMock(return_value=json.dumps({"results": []}))
@@ -1737,8 +1731,6 @@ class TestThreadResolution:
 
         verify_response = json.dumps({"results": []})
         llm = MagicMock(spec=LLMProvider)
-        # No tool calls: the agentic loop exits and the forced review runs.
-        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1775,10 +1767,6 @@ class TestThreadResolution:
         )
 
         llm = MagicMock(spec=LLMProvider)
-
-        # No tool calls: the agentic loop exits and the forced review runs.
-
-        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
