@@ -15,7 +15,7 @@ from typing import ClassVar
 import httpx
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
+from mira.exceptions import LLMError, NonRetriableLLMError, StructuredOutputError
 from mira.llm.base import OpenAICompatibleProvider, _strip_model_prefix
 from mira.llm.response_parser import validate_tool_arguments
 from mira.llm.utils import _ensure_json_hint
@@ -52,19 +52,28 @@ def _responses_input(messages: list[dict]) -> list[dict]:
         if role == "assistant":
             content = msg.get("content")
             tool_calls = msg.get("tool_calls") or []
-            if not content and not tool_calls:
+            reasoning_items = msg.get("reasoning_items") or []
+            if not content and not tool_calls and not reasoning_items:
                 continue  # skip empty assistant
+            # Replay the provider's reasoning items before the assistant text
+            # and function calls. OpenAI uses this for encrypted reasoning;
+            # DeepSeek merges reasoning input items into the adjacent message.
+            for item in reasoning_items:
+                items.append(dict(item))
             if content:
                 items.append({"type": "message", "role": "assistant", "content": content})
             for tc in tool_calls:
                 args = tc.get("function", {}).get("arguments", "{}")
                 if isinstance(args, dict):
                     args = json.dumps(args)
+                call_id = tc.get("id", "")
                 items.append(
                     {
                         "type": "function_call",
-                        "id": tc.get("id", ""),
-                        "call_id": tc.get("id", ""),
+                        # ``id`` identifies the output item; ``call_id`` pairs
+                        # the call with its function_call_output.
+                        "id": tc.get("provider_id") or call_id,
+                        "call_id": call_id,
                         "name": tc.get("function", {}).get("name", ""),
                         "arguments": args,
                     }
@@ -125,6 +134,7 @@ def _response_message(data: dict) -> dict:
     output = data.get("output", [])
     text_parts: list[str] = []
     tool_calls: list[dict] = []
+    reasoning_items: list[dict] = []
 
     for item in output:
         itype = item.get("type", "")
@@ -134,6 +144,10 @@ def _response_message(data: dict) -> dict:
                 for part in content:
                     if part.get("type") in ("output_text", "text"):
                         text_parts.append(part.get("text", ""))
+        elif itype == "reasoning":
+            # Keep the provider's item intact (encrypted content, signature,
+            # summary, or plain reasoning text) so it can be replayed.
+            reasoning_items.append(dict(item))
         elif itype == "function_call":
             # In Responses API, name/arguments are direct on the item
             name = item.get("name", "")
@@ -142,13 +156,20 @@ def _response_message(data: dict) -> dict:
             tool_calls.append(
                 {
                     "id": call_id,
+                    "provider_id": item.get("id", ""),
                     "type": "function",
                     "function": {"name": name, "arguments": arguments},
                 }
             )
 
     content = "".join(text_parts) if text_parts else (None if tool_calls else "")
-    return {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    if reasoning_items:
+        message["reasoning_items"] = reasoning_items
+    finish_reason = data.get("status") or (data.get("incomplete_details") or {}).get("reason")
+    if finish_reason:
+        message["finish_reason"] = finish_reason
+    return message
 
 
 # ── Provider class ──────────────────────────────────────────────────
@@ -170,6 +191,9 @@ class ResponsesProvider(OpenAICompatibleProvider):
         self._url = f"{config.base_url.rstrip('/')}/responses"
 
     # ── Overrides ────────────────────────────────────────────────────
+
+    def _apply_reasoning(self, body: dict, protocol: str = "responses") -> None:
+        super()._apply_reasoning(body, protocol=protocol)
 
     def _account_usage(self, data: dict) -> None:
         """Accumulate token counts from Responses API usage.
@@ -202,7 +226,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
         if json_mode:
             body["text"] = {"format": {"type": "json_object"}}
             body["input"] = _ensure_json_hint(body["input"])
-        self._apply_reasoning(body)
+        self._apply_reasoning(body, protocol="responses")
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(
@@ -214,7 +238,39 @@ class ResponsesProvider(OpenAICompatibleProvider):
             data = resp.json()
 
         self._account_usage(data)
-        return _output_text(data)
+        text = _output_text(data) or ""
+        if not text.strip():
+            refused = any(
+                item.get("type") == "message"
+                and item.get("role") == "assistant"
+                and isinstance(item.get("content"), list)
+                and any(
+                    isinstance(part, dict) and part.get("type") == "refusal"
+                    for part in item["content"]
+                )
+                for item in data.get("output") or []
+            )
+            filtered = (
+                data.get("status") == "incomplete"
+                and (data.get("incomplete_details") or {}).get("reason") == "content_filter"
+            )
+            if refused or filtered:
+                raise NonRetriableLLMError("completion_blocked", protocol="responses")
+            response_status = data.get("status")
+            if response_status not in (
+                "completed",
+                "incomplete",
+                "failed",
+                "in_progress",
+                "queued",
+                "cancelled",
+            ):
+                response_status = "other"
+            raise LLMError(
+                "empty_response",
+                detail=f"protocol=responses status={resp.status_code} response_status={response_status} content_len={len(text)}",
+            )
+        return text
 
     async def _call_llm_with_tools(
         self,
@@ -222,18 +278,21 @@ class ResponsesProvider(OpenAICompatibleProvider):
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
         """Make an LLM call with tool/function calling and retries.
 
         The LLM returns structured data by 'calling' a tool. We extract the
-        tool arguments as the JSON response.
+        tool arguments as the JSON response. ``force_tool`` forces a named
+        tool and rejects prose with ``StructuredOutputError``.
         """
         api_model = _strip_model_prefix(model, self.config.base_url)
         if not tools:
             raise LLMError("no_tools")
+        forced_tool_name = force_tool or tools[0]["function"]["name"]
         forced_choice: dict | str = {
             "type": "function",
-            "name": tools[0]["function"]["name"],
+            "name": forced_tool_name,
         }
         body: dict = {
             "model": api_model,
@@ -243,7 +302,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }
-        self._apply_reasoning(body)
+        self._apply_reasoning(body, protocol="responses")
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(
@@ -267,7 +326,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             ):
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                self._disable_reasoning(body)
+                self._disable_reasoning(body, protocol="responses")
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
@@ -279,6 +338,19 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
         # Check for tool calls in the response
         output = data.get("output", [])
+        if force_tool:
+            for item in output:
+                if item.get("type") == "function_call" and item.get("name") == force_tool:
+                    return item.get("arguments") or "{}"
+            text = _output_text(data)
+            excerpt = " ".join(text.split())[:300]
+            raise StructuredOutputError(
+                "structured_output",
+                model=api_model,
+                tool=force_tool,
+                excerpt=excerpt or "(empty response)",
+            )
+
         for item in output:
             if item.get("type") == "function_call":
                 arguments = item.get("arguments") or "{}"
@@ -294,7 +366,20 @@ class ResponsesProvider(OpenAICompatibleProvider):
             logger.warning("Model returned content instead of tool call, using content as fallback")
             return validate_tool_arguments(text, provider=self.config.provider, model=api_model)
 
-        raise LLMError("no_tool_call")
+        # Neither a function call nor text. Carry the response shape on the
+        # error's full message — counts only, never reasoning text.
+        usage = data.get("usage") or {}
+        output_details = usage.get("output_tokens_details") or {}
+        detail = (
+            f"status={resp.status_code} "
+            f"response_status={data.get('status')} "
+            f"incomplete={(data.get('incomplete_details') or {}).get('reason')} "
+            f"output_items={[item.get('type') for item in output]} "
+            f"input_tokens={usage.get('input_tokens')} "
+            f"output_tokens={usage.get('output_tokens')} "
+            f"reasoning_tokens={output_details.get('reasoning_tokens')}"
+        )
+        raise LLMError("no_tool_call", detail=detail)
 
     async def _call_llm_agentic(
         self,
@@ -318,7 +403,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }
-        self._apply_reasoning(body)
+        self._apply_reasoning(body, protocol="responses")
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(
@@ -334,7 +419,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 api_model = _strip_model_prefix(model, self.config.base_url)
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                self._disable_reasoning(body)
+                self._disable_reasoning(body, protocol="responses")
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )

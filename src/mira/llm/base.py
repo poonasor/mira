@@ -10,7 +10,7 @@ import httpx
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError, NonRetriableLLMError
+from mira.exceptions import LLMError, NonRetriableLLMError, StructuredOutputError
 from mira.llm import provider_profiles as profiles
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 
@@ -48,6 +48,7 @@ class LLMProviderProtocol(Protocol):
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str: ...
 
     async def complete_agentic(
@@ -110,13 +111,19 @@ def _strip_model_prefix(model: str, base_url: str) -> str:
 
 
 def _retriable(exception: BaseException) -> bool:
-    """Return True for transient errors; False for 4xx non-retriable errors."""
-    if isinstance(exception, NonRetriableLLMError):
+    """Return True for transient errors; False for 4xx and semantic failures."""
+    if isinstance(exception, (NonRetriableLLMError, StructuredOutputError)):
         return False
     return isinstance(
         exception,
         (httpx.TimeoutException, httpx.NetworkError, LLMError),
     )
+
+
+def _exception_excerpt(error: BaseException, limit: int = 300) -> str:
+    """Short, single-line error text safe to put in a diagnostic message."""
+    text = " ".join(str(error).split())
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 # ── Shared base for OpenAI-compatible providers ─────────────────────
@@ -140,6 +147,9 @@ class OpenAICompatibleProvider:
         self.profile = profiles.resolve(config.base_url)
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Prompt-cache activity reported by the endpoint (subset of prompt tokens).
+        self.total_cache_read_tokens = 0
+        self.total_cache_write_tokens = 0
         self._no_forced_tool_choice: set[str] = set()
         self._no_reasoning: set[str] = set()
 
@@ -189,18 +199,58 @@ class OpenAICompatibleProvider:
             return "auto"
         return forced_choice
 
-    def _apply_reasoning(self, body: dict) -> None:
-        """Enable extended thinking when a reasoning effort is configured.
+    def _max_tokens_field(self) -> str:
+        """Name of the Chat Completions output-token field for this profile."""
+        return self.profile.get("max_tokens_field", "max_tokens")
 
-        The portable shape is the nested ``reasoning.effort`` knob. Provider
-        profiles can select another wire shape; Z.AI uses a top-level
-        ``reasoning_effort`` plus ``thinking.type`` and defaults thinking on,
-        so Mira must explicitly disable it when the configured effort is off.
+    @staticmethod
+    def _remove_reasoning(body: dict) -> None:
+        """Drop every reasoning-shaped field Mira may have added."""
+        for key in ("reasoning", "reasoning_effort", "thinking", "enable_thinking"):
+            body.pop(key, None)
+
+    @staticmethod
+    def _has_reasoning(body: dict) -> bool:
+        return any(
+            key in body for key in ("reasoning", "reasoning_effort", "thinking", "enable_thinking")
+        )
+
+    def _apply_reasoning_off(self, body: dict, protocol: str = "chat") -> None:
+        """Apply a profile's explicit "thinking off" payload, if it has one.
+
+        Chat and Responses disable thinking differently, so the Responses
+        payload is separate. Providers with no documented disable remain a
+        no-op (their default applies).
+        """
+        key = (
+            "reasoning_off_payload_responses"
+            if protocol == "responses"
+            else "reasoning_off_payload"
+        )
+        body.update(self.profile.get(key, {}))
+
+    def _apply_reasoning(self, body: dict, protocol: str = "chat") -> None:
+        """Add the provider's documented reasoning toggle and effort field.
+
+        Chat Completions uses the top-level ``reasoning_effort`` field on
+        OpenAI and most compatible endpoints; OpenRouter accepts that same
+        shorthand. Responses API uses ``reasoning.effort``. Providers that
+        need a separate toggle (DeepSeek) get it from the profile.
+
+        Anthropic-style models reject a custom ``temperature`` while thinking
+        is on, so we drop it when reasoning is applied. When reasoning is off
+        or was previously rejected for this model, the profile's explicit off
+        payload is applied instead.
+
+        Profiles with ``reasoning_style: "zai"`` (Z.AI GLM, chat only) use a
+        top-level ``reasoning_effort`` plus ``thinking.type``. Z.AI thinks by
+        default, so Mira explicitly sends ``thinking.type = disabled`` when
+        the configured effort is off or was rejected for this model.
         """
         effort = self.config.reasoning_effort
-        style = self.profile.get("reasoning_style", "nested")
-        if style == "zai":
+        if self.profile.get("reasoning_style", "nested") == "zai":
             if not effort or effort == "off" or body.get("model") in self._no_reasoning:
+                body.pop("reasoning_effort", None)
                 body["thinking"] = {"type": "disabled"}
                 return
             effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
@@ -208,27 +258,31 @@ class OpenAICompatibleProvider:
             body["reasoning_effort"] = effort
             return
 
-        if not effort or effort == "off":
-            return
-        if body.get("model") in self._no_reasoning:
+        if not effort or effort == "off" or body.get("model") in self._no_reasoning:
+            self._apply_reasoning_off(body, protocol)
             return
         effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
-        body["reasoning"] = {"effort": effort}
+        if protocol == "responses":
+            body["reasoning"] = {"effort": effort}
+        else:
+            body["reasoning_effort"] = effort
+            body.update(self.profile.get("reasoning_on_payload", {}))
         body.pop("temperature", None)
 
     def _reasoning_is_enabled(self, body: dict) -> bool:
-        """Whether the request body currently asks the endpoint to reason."""
+        """Whether the request body carries reasoning fields worth retrying without."""
         if self.profile.get("reasoning_style") == "zai":
             return body.get("thinking", {}).get("type") == "enabled"
-        return "reasoning" in body
+        return self._has_reasoning(body)
 
-    def _disable_reasoning(self, body: dict) -> None:
+    def _disable_reasoning(self, body: dict, protocol: str = "chat") -> None:
         """Rewrite a request body to disable its profile-specific reasoning."""
         if self.profile.get("reasoning_style") == "zai":
             body.pop("reasoning_effort", None)
             body["thinking"] = {"type": "disabled"}
             return
-        body.pop("reasoning", None)
+        self._remove_reasoning(body)
+        self._apply_reasoning_off(body, protocol)
 
     def _account_usage(self, data: dict) -> None:
         """Accumulate token counts. Default: chat/completions key names.
@@ -240,6 +294,18 @@ class OpenAICompatibleProvider:
         if usage:
             self.total_prompt_tokens += usage.get("prompt_tokens", 0)
             self.total_completion_tokens += usage.get("completion_tokens", 0)
+            details = usage.get("prompt_tokens_details") or {}
+            cache_read = details.get("cached_tokens") or 0
+            cache_write = details.get("cache_write_tokens") or 0
+            self.total_cache_read_tokens += cache_read
+            self.total_cache_write_tokens += cache_write
+            if cache_read or cache_write:
+                logger.info(
+                    "LLM prompt cache: read=%d write=%d prompt=%d",
+                    cache_read,
+                    cache_write,
+                    usage.get("prompt_tokens", 0),
+                )
 
     @staticmethod
     def _handle_error(resp: httpx.Response) -> None:
@@ -267,6 +333,7 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
         raise NotImplementedError
 
@@ -331,11 +398,22 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
-        """Complete a prompt using tool calling for structured output."""
+        """Complete a prompt using tool calling for structured output.
+
+        ``force_tool`` names the tool to force and switches on strict structured
+        output: a successful response that contains prose instead of that tool
+        call raises ``StructuredOutputError``. Without it the historical text
+        fallback is preserved for callers that tolerate prose.
+        """
         try:
             return await self._call_llm_with_tools(
-                self.config.model, messages, tools, temperature=temperature
+                self.config.model,
+                messages,
+                tools,
+                temperature=temperature,
+                force_tool=force_tool,
             )
         except NonRetriableLLMError:
             raise
@@ -353,14 +431,26 @@ class OpenAICompatibleProvider:
                         messages,
                         tools,
                         temperature=temperature,
+                        force_tool=force_tool,
                     )
                 except Exception as fallback_err:
+                    if isinstance(primary_err, StructuredOutputError) or isinstance(
+                        fallback_err, StructuredOutputError
+                    ):
+                        raise StructuredOutputError(
+                            "structured_output",
+                            model=self.config.fallback_model,
+                            tool=force_tool or "structured tool",
+                            excerpt=_exception_excerpt(fallback_err),
+                        ) from fallback_err
                     raise LLMError(
                         "both_models_failed",
                         primary_model=self.config.model,
                         fallback_model=self.config.fallback_model,
                         error=fallback_err,
                     ) from fallback_err
+            if isinstance(primary_err, StructuredOutputError):
+                raise
             raise LLMError(
                 "tool_call_failed", model=self.config.model, error=primary_err
             ) from primary_err

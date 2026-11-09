@@ -49,3 +49,7 @@ register_provider("forgejo", ForgejoProvider)
 from mira.providers.origin import OriginProvider  # noqa: E402
 
 register_provider("origin", OriginProvider)
+
+from mira.providers.bitbucket import BitbucketProvider  # noqa: E402
+
+register_provider("bitbucket", BitbucketProvider)

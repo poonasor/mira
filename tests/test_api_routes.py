@@ -34,6 +34,8 @@ EXPECTED_ROUTES = {
     ("/api/forgejo/sync", "POST"),
     ("/api/origin/repos", "POST"),
     ("/api/origin/sync", "POST"),
+    ("/api/bitbucket/repos", "POST"),
+    ("/api/bitbucket/sync", "POST"),
     ("/api/indexing/estimate", "GET"),
     ("/api/indexing/status", "GET"),
     ("/api/learned-rules", "GET"),

@@ -141,8 +141,8 @@ async def test_pr_opened_allowlist_filters_off_list(client):
 
 
 @pytest.mark.asyncio
-async def test_comment_review_bypass(client):
-    """Manual @mira-bot review comment bypasses the author filter."""
+async def test_comment_review_ignores_author_filter(client):
+    """Commands use the command policy, not the auto-review author filter."""
     with (
         patch("mira.platforms.forgejo.webhook.handle_forgejo_note", new=AsyncMock()) as h,
         patch(
@@ -166,8 +166,8 @@ async def test_comment_review_bypass(client):
 
 
 @pytest.mark.asyncio
-async def test_comment_non_review_no_bypass(client):
-    """Non-review command (pause) by blocked author does NOT bypass filter."""
+async def test_comment_non_review_ignores_author_filter(client):
+    """Free-form command dispatch is separate from the auto-review author filter."""
     with (
         patch("mira.platforms.forgejo.webhook.handle_forgejo_note", new=AsyncMock()) as h,
         patch(
@@ -186,5 +186,5 @@ async def test_comment_non_review_no_bypass(client):
             },
         )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "ignored"
-    h.assert_not_called()
+    assert resp.json()["status"] == "processing"
+    h.assert_awaited_once()

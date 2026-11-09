@@ -78,6 +78,9 @@ class LLMConfig(BaseModel):
     request_timeout: int = Field(default=120, ge=1)
     retry_min_wait: int = Field(default=2, ge=0)
     retry_max_wait: int = Field(default=30, ge=0)
+    # Send Anthropic prompt-cache breakpoints when the endpoint's provider
+    # profile supports them (OpenRouter) and the model is anthropic/*.
+    prompt_caching: bool = True
     # Codex CLI provider settings. Auth is handled by Codex itself through
     # CODEX_HOME/auth.json from `codex login`; Mira does not need an OpenAI API key.
     codex_command: str = "codex"
@@ -169,6 +172,41 @@ class FilterConfig(BaseModel):
     blocked_authors: list[str] = Field(default_factory=list)
 
 
+class CommandOverrideConfig(BaseModel):
+    """Per-command allow/deny override.
+
+    Setting ``allowed_users`` replaces the global command allowlist for this
+    command only. ``blocked_users`` adds command-specific denials on top of
+    the global deny list. The global ``allow_repo_write_access`` gate still
+    applies to every command.
+    """
+
+    allowed_users: list[str] | None = None
+    blocked_users: list[str] | None = None
+
+
+class CommandsConfig(BaseModel):
+    """Who may invoke interactive @-mention commands.
+
+    The default posture is repo writers/admins only. ``allowed_users`` grants
+    command access explicitly (including to read-only users), while
+    ``blocked_users`` always denies. Per-command overrides replace the global
+    user allowlist for that command only and may add command-specific denials;
+    the write-access gate stays global.
+    """
+
+    allowed_users: list[str] = Field(default_factory=list)
+    allow_repo_write_access: bool = True
+    blocked_users: list[str] = Field(default_factory=list)
+    review: CommandOverrideConfig | None = None
+    review_rest: CommandOverrideConfig | None = None
+    help: CommandOverrideConfig | None = None
+    pause: CommandOverrideConfig | None = None
+    resume: CommandOverrideConfig | None = None
+    reject: CommandOverrideConfig | None = None
+    ask: CommandOverrideConfig | None = None
+
+
 class OverlapConfig(BaseModel):
     """Cross-PR overlap detection ("stepping on each other's toes").
 
@@ -204,6 +242,10 @@ class ReviewConfig(BaseModel):
     # listed as skipped.
     max_chunks_per_review: int = Field(default=5, ge=1, le=20)
     include_summary: bool = True
+    # List findings the self-critique graded "plausible" but did not post in a
+    # collapsed "Worth a look (not verified)" walkthrough section (max 5).
+    # Never inline, never in key issues. Off by default.
+    show_unverified_findings: bool = False
     focus_only_on_problems: bool = False
     walkthrough: bool = True
     walkthrough_sequence_diagram: bool = True
@@ -269,6 +311,21 @@ class ReviewConfig(BaseModel):
     # thorough).
     agentic_tools: bool = True
 
+    # Investigation turns the reviewer gets per chunk before it is asked to
+    # submit. Each turn is one model call that may issue several tool calls.
+    # The submission is always forced over the full investigation transcript
+    # when the budget runs out, so a low cap costs depth, never the review.
+    agentic_max_hops: int = Field(default=10, ge=1, le=30)
+
+    # After the reviewer submits, ask it once more — over the same transcript —
+    # for the concrete defects it analysed but withheld as minor or uncertain,
+    # and append them. One extra model call per chunk (prompt-cached by most
+    # providers). On the five-PR sample it raised recall (50% → 56-59% pooled
+    # over two flash models) at a precision cost that left F1 flat, and added
+    # ~25 s per DeepSeek review, so it is the opt-in "thorough" setting, like
+    # ensemble_runs, rather than the default.
+    second_look: bool = False
+
     # Whether the JIT cross-file resolver should attempt Java + Go imports.
     # Resolution for those languages is heuristic (we can't see the build
     # system), and a wrong-file pick pollutes the prompt with off-topic
@@ -332,6 +389,7 @@ class DatabaseConfig(BaseModel):
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+    commands: CommandsConfig = Field(default_factory=CommandsConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     index: IndexConfig = Field(default_factory=IndexConfig)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -389,12 +447,14 @@ def _strip_deployment_only_llm_settings(overlay: dict[str, Any]) -> dict[str, An
     """Remove execution and credential-routing settings from an untrusted per-repo overlay."""
     cleaned = dict(overlay)
     llm = cleaned.get("llm")
-    if not isinstance(llm, dict):
-        return cleaned
-    cleaned_llm = dict(llm)
-    for key in _DEPLOYMENT_ONLY_LLM_KEYS:
-        cleaned_llm.pop(key, None)
-    cleaned["llm"] = cleaned_llm
+    if isinstance(llm, dict):
+        cleaned_llm = dict(llm)
+        for key in _DEPLOYMENT_ONLY_LLM_KEYS:
+            cleaned_llm.pop(key, None)
+        cleaned["llm"] = cleaned_llm
+    # Command authorization is deployment-controlled: a repository must not
+    # be able to widen its own command allowlist.
+    cleaned.pop("commands", None)
     return cleaned
 
 

@@ -48,7 +48,7 @@ def register_dashboard(app: FastAPI) -> None:
 
 # Standalone app — initialized at module load, but routes are registered at
 # the bottom of this file, *after* all @router decorators have run.
-app = FastAPI(title="Mira Dashboard API", version="0.9.1")
+app = FastAPI(title="Mira Dashboard API", version="0.11.0")
 
 _INDEX_DIR = os.environ.get("MIRA_INDEX_DIR", "/data/indexes")
 
@@ -58,8 +58,8 @@ def _get_index_dir() -> str:
 
 
 # Cross-platform preference order used when the same owner/repo exists on
-# more than one platform: github → gitlab → forgejo → origin.
-_PLATFORM_ORDER = {"github": 0, "gitlab": 1, "forgejo": 2, "origin": 3}
+# more than one platform: github → gitlab → forgejo → origin → bitbucket.
+_PLATFORM_ORDER = {"github": 0, "gitlab": 1, "forgejo": 2, "origin": 3, "bitbucket": 4}
 
 
 def _pick_platform_record(records: list[RepoRecord]) -> RepoRecord:
@@ -344,6 +344,10 @@ class OriginRepoRegister(BaseModel):
     project: str  # "owner/repo"
 
 
+class BitbucketRepoRegister(BaseModel):
+    project: str  # "workspace/repo_slug"
+
+
 class CostEstimate(BaseModel):
     estimated_usd: float
     input_tokens: int
@@ -421,7 +425,7 @@ class GlobalSettingsUpdate(BaseModel):
 
 # Only `filter` and `review` are admin-editable from the UI; LLM creds and
 # DB settings stay env-only and would be silently overwritten if exposed
-# here.
+# here. `commands` is deliberately deployment-config-only (`mira.yaml`).
 _ALLOWED_OVERRIDE_SECTIONS = {"filter", "review"}
 
 
@@ -529,6 +533,7 @@ async def _run_initial_indexing(default_mode: str) -> None:
     gitlab_token = os.environ.get("MIRA_GITLAB_TOKEN", "")
     forgejo_token = os.environ.get("MIRA_FORGEJO_TOKEN", "")
     origin_token = os.environ.get("MIRA_ORIGIN_TOKEN", "")
+    bitbucket_token = os.environ.get("MIRA_BITBUCKET_TOKEN", "")
 
     from mira.config import load_config
     from mira.dashboard.models_config import llm_config_for
@@ -536,20 +541,26 @@ async def _run_initial_indexing(default_mode: str) -> None:
     from mira.llm import create_llm
     from mira.platforms.fetch import EmptyRepoError, make_fetcher
 
-    config = load_config()
-    llm = create_llm(llm_config_for("indexing", config.llm))
+    try:
+        config = load_config()
+        llm = create_llm(llm_config_for("indexing", config.llm))
+    except Exception as exc:
+        # Runs as a fire-and-forget task: without this, the error is lost and
+        # every repo in the batch stays "indexing" until a restart.
+        logger.exception("Initial indexing setup failed")
+        for r in to_index:
+            _app_db.set_repo_status(r.owner, r.repo, "failed", error=str(exc), platform=r.platform)
+        return
 
     for repo_record in to_index:
         owner, repo, platform = repo_record.owner, repo_record.repo, repo_record.platform
         full_name = f"{owner}/{repo}"
-        if platform == "gitlab":
-            token = gitlab_token
-        elif platform == "forgejo":
-            token = forgejo_token
-        elif platform == "origin":
-            token = origin_token
-        else:
-            token = github_token
+        token = {
+            "gitlab": gitlab_token,
+            "forgejo": forgejo_token,
+            "origin": origin_token,
+            "bitbucket": bitbucket_token,
+        }.get(platform, github_token)
         if not token:
             # No usable token for this platform — leave it pending instead of
             # crashing on an empty auth header.

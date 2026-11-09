@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
+from mira.index._package_search import PackageGroups
 from mira.index._store_shared import _StoreSharedMixin
 from mira.index.store import (
     BlastRadiusEntry,
@@ -185,6 +186,7 @@ CREATE TABLE IF NOT EXISTS feedback_events (
     comment_title TEXT NOT NULL DEFAULT '',
     signal TEXT NOT NULL DEFAULT '',
     actor TEXT NOT NULL DEFAULT '',
+    pr_author TEXT NOT NULL DEFAULT '',
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
@@ -280,6 +282,10 @@ def _get_conn(url: str) -> Any:
                         "TEXT NOT NULL DEFAULT ''"
                     )
                 cur.execute(
+                    "ALTER TABLE feedback_events ADD COLUMN IF NOT EXISTS pr_author "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
                     "ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS status "
                     "TEXT NOT NULL DEFAULT 'approved'"
                 )
@@ -314,7 +320,7 @@ def _registry_owner(storage_owner: str) -> str:
     use the clean owner to resolve the repository and ``IndexStore.open`` adds
     the storage prefix again after determining its platform.
     """
-    for platform in ("gitlab", "forgejo"):
+    for platform in ("gitlab", "forgejo", "bitbucket"):
         prefix = f"_{platform}/"
         if storage_owner.startswith(prefix):
             return storage_owner[len(prefix) :]
@@ -426,22 +432,14 @@ def list_packages_org_wide(url: str) -> list[dict]:
     ]
 
 
-def search_packages_org_wide(
-    url: str,
-    name: str | None = None,
-    version: str | None = None,
-    kind: str | None = None,
-    is_dev: bool | None = None,
-    limit: int = 500,
-) -> list[dict]:
-    """Search for packages across every repo in the org.
-
-    Returns rows of {owner, repo, name, kind, version, file_path, is_dev}.
-    Case-insensitive name and version match (ILIKE with implicit wildcards).
-    Empty/None filters are ignored. Backs the org-wide package search page —
-    used for incident response ("which repos use lodash@4.17.20 after this
-    CVE?") and upgrade audits.
-    """
+def _package_search_query(
+    name: str | None,
+    version: str | None,
+    kind: str | None,
+    is_dev: bool | None,
+    limit: int | None,
+) -> tuple[str, tuple]:
+    """Share the existing backend matching/order between raw and grouped reads."""
     clauses: list[str] = []
     params: list = []
     if name:
@@ -462,9 +460,30 @@ def search_packages_org_wide(
         "SELECT owner, repo, name, kind, version, file_path, is_dev "
         f"FROM package_manifests {where} "
         "ORDER BY LOWER(name), owner, repo "
-        "LIMIT %s"
     )
-    params.append(limit)
+    if limit is not None:
+        sql += "LIMIT %s"
+        params.append(limit)
+    return sql, tuple(params)
+
+
+def search_packages_org_wide(
+    url: str,
+    name: str | None = None,
+    version: str | None = None,
+    kind: str | None = None,
+    is_dev: bool | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Search for packages across every repo in the org.
+
+    Returns rows of {owner, repo, name, kind, version, file_path, is_dev}.
+    Case-insensitive name and version match (ILIKE with implicit wildcards).
+    Empty/None filters are ignored. Backs the org-wide package search page —
+    used for incident response ("which repos use lodash@4.17.20 after this
+    CVE?") and upgrade audits.
+    """
+    sql, params = _package_search_query(name, version, kind, is_dev, limit)
 
     with _pg_cursor(url) as cur:
         cur.execute(sql, tuple(params))
@@ -482,6 +501,40 @@ def search_packages_org_wide(
         }
         for r in rows
     ]
+
+
+def search_package_groups_org_wide(
+    url: str,
+    name: str | None = None,
+    version: str | None = None,
+    kind: str | None = None,
+    is_dev: bool | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Stream final groups in the existing database order on a server cursor."""
+    from mira.db.postgres import connect
+
+    groups = PackageGroups(limit, postgres_order=True)
+    sql, params = _package_search_query(name, version, kind, is_dev, None)
+    _get_conn(url)  # Preserve the raw helper's lazy schema initialization.
+    with connect(url) as conn, conn.transaction():
+        conn.execute("SET TRANSACTION READ ONLY")
+        with conn.cursor(name="mira_package_search") as cursor:
+            cursor.itersize = 128
+            cursor.execute(sql, params)
+            for r in cursor:
+                groups.add(
+                    {
+                        "owner": _registry_owner(r[0]),
+                        "repo": r[1],
+                        "name": r[2],
+                        "kind": r[3],
+                        "version": r[4],
+                        "file_path": r[5],
+                        "is_dev": bool(r[6]),
+                    }
+                )
+    return groups.finish()
 
 
 class PgIndexStore(_StoreSharedMixin):
@@ -910,6 +963,25 @@ class PgIndexStore(_StoreSharedMixin):
             for r in rows
         ]
 
+    @contextmanager
+    def iter_review_events(self) -> Iterator[Iterator[ReviewEvent]]:
+        """Stream history on a dedicated read-only transaction and server cursor."""
+        from mira.db.postgres import connect
+
+        with connect(self._url) as conn, conn.transaction():
+            conn.execute("SET TRANSACTION READ ONLY")
+            with conn.cursor(name="mira_review_history") as cursor:
+                cursor.itersize = 128
+                cursor.execute(
+                    "SELECT id, pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
+                    "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
+                    "categories, created_at, author_avatar_url, reviewed_paths "
+                    "FROM review_events WHERE owner=%s AND repo=%s "
+                    "ORDER BY created_at DESC, id ASC",
+                    (self._owner, self._repo),
+                )
+                yield (ReviewEvent(*row) for row in cursor)
+
     def list_review_events(self, limit: int = 100) -> list[ReviewEvent]:
         rows = self._fetchall(
             "SELECT id, pr_number, pr_title, pr_url, comments_posted, blockers, warnings, "
@@ -1105,6 +1177,41 @@ class PgIndexStore(_StoreSharedMixin):
             for r in rows
         ]
 
+    def get_review_quality_by_author(self, author: str, since: float | None = None) -> dict:
+        """Sum the blockers/warnings/suggestions raised on one author's PRs."""
+        params: list = [self._owner, self._repo, author]
+        since_clause = ""
+        if since is not None:
+            since_clause = " AND created_at >= %s"
+            params.append(since)
+        row = self._fetchone(
+            "SELECT COUNT(*), COALESCE(SUM(blockers),0), COALESCE(SUM(warnings),0), "
+            "COALESCE(SUM(suggestions),0), COALESCE(SUM(comments_posted),0) "
+            f"FROM review_events WHERE owner=%s AND repo=%s AND author=%s{since_clause}",
+            tuple(params),
+        )
+        return {
+            "reviews": int(row[0] or 0),
+            "blockers": int(row[1] or 0),
+            "warnings": int(row[2] or 0),
+            "suggestions": int(row[3] or 0),
+            "comments_posted": int(row[4] or 0),
+        }
+
+    def get_feedback_quality_by_author(self, pr_author: str) -> dict:
+        """Accept/reject tallies for Mira's feedback on one author's PRs."""
+        rows = self._fetchall(
+            "SELECT signal, COUNT(*) FROM feedback_events "
+            "WHERE owner=%s AND repo=%s AND pr_author=%s GROUP BY signal",
+            (self._owner, self._repo, pr_author),
+        )
+        counts = {signal: int(count) for signal, count in rows}
+        return {
+            "accepted": counts.get("accepted", 0),
+            "rejected": counts.get("rejected", 0),
+            "human_review": counts.get("human_review", 0),
+        }
+
     def get_review_stats(self, since: float | None = None) -> dict:
         params: list = [self._owner, self._repo]
         since_clause = ""
@@ -1260,14 +1367,16 @@ class PgIndexStore(_StoreSharedMixin):
         comment_title: str,
         signal: str,
         actor: str,
+        pr_author: str = "",
     ) -> FeedbackEventRow:
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO feedback_events "
                 "(owner, repo, pr_number, pr_url, comment_path, comment_line, "
-                "comment_category, comment_severity, comment_title, signal, actor, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                "comment_category, comment_severity, comment_title, signal, actor, pr_author, "
+                "created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 (
                     self._owner,
                     self._repo,
@@ -1280,6 +1389,7 @@ class PgIndexStore(_StoreSharedMixin):
                     comment_title,
                     signal,
                     actor,
+                    pr_author,
                     now,
                 ),
             )
@@ -1296,6 +1406,7 @@ class PgIndexStore(_StoreSharedMixin):
             comment_title=comment_title,
             signal=signal,
             actor=actor,
+            pr_author=pr_author,
             created_at=now,
         )
 
@@ -1321,6 +1432,7 @@ class PgIndexStore(_StoreSharedMixin):
                 e["comment_title"],
                 e["signal"],
                 e["actor"],
+                e.get("pr_author", ""),
                 now,
             )
             for e in events
@@ -1329,8 +1441,9 @@ class PgIndexStore(_StoreSharedMixin):
             cur.executemany(
                 "INSERT INTO feedback_events "
                 "(owner, repo, pr_number, pr_url, comment_path, comment_line, "
-                "comment_category, comment_severity, comment_title, signal, actor, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "comment_category, comment_severity, comment_title, signal, actor, pr_author, "
+                "created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 rows,
             )
         self._commit()

@@ -389,6 +389,51 @@ class TestGetFileHistory:
             assert await GitLabProvider("tok").get_file_history(_PR, []) == {}
 
 
+class TestGetRepoPermission:
+    @pytest.mark.asyncio
+    async def test_looks_up_member_by_username(self):
+        def handler(method, url, **kw):
+            assert "/members/all" in url
+            assert "query=alice" in url
+            return _FakeResp(json_data=[{"username": "alice", "access_level": 30}])
+
+        with _patch(handler):
+            permission = await GitLabProvider("tok").get_repo_permission("group", "proj", "alice")
+        assert permission == "write"
+
+    @pytest.mark.asyncio
+    async def test_looks_up_member_by_user_id(self):
+        def handler(method, url, **kw):
+            assert "/members/all/42" in url
+            return _FakeResp(json_data={"username": "alice", "access_level": 20})
+
+        with _patch(handler):
+            permission = await GitLabProvider("tok").get_repo_permission(
+                "group", "proj", "alice", user_id=42
+            )
+        assert permission == "read"
+
+    @pytest.mark.asyncio
+    async def test_missing_member_is_none(self):
+        def handler(method, url, **kw):
+            return _FakeResp(json_data=[])
+
+        with _patch(handler):
+            permission = await GitLabProvider("tok").get_repo_permission("group", "proj", "alice")
+        assert permission == "none"
+
+    @pytest.mark.asyncio
+    async def test_missing_user_id_is_none(self):
+        def handler(method, url, **kw):
+            return _FakeResp(status=404, json_data={})
+
+        with _patch(handler):
+            permission = await GitLabProvider("tok").get_repo_permission(
+                "group", "proj", "alice", user_id=42
+            )
+        assert permission == "none"
+
+
 class TestRegistry:
     def test_create_provider_gitlab(self):
         assert isinstance(create_provider("gitlab", "tok"), GitLabProvider)

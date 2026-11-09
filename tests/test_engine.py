@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +21,7 @@ from mira.core.engine import (
     _security_relevant_files,
 )
 from mira.core.threads import _extract_sections
+from mira.exceptions import ProviderError
 from mira.llm.provider import LLMProvider
 from mira.models import (
     WALKTHROUGH_MARKER,
@@ -108,6 +110,8 @@ _WALKTHROUGH_LLM_RESPONSE = json.dumps(
 @pytest.fixture
 def mock_llm(sample_llm_response_text: str) -> LLMProvider:
     llm = MagicMock(spec=LLMProvider)
+    # No tool calls: the agentic loop exits and the forced review runs.
+    llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
     # Tool-calling methods used by engine
     llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
     llm.review = AsyncMock(return_value=sample_llm_response_text)
@@ -169,6 +173,8 @@ class TestReviewEngine:
         """A corrupted walkthrough LLM response (invalid JSON tool-call args)
         is retried up to 3 times instead of dropping the walkthrough."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         responses = [
             "NOT VALID JSON {{{",  # corrupted tool-call arguments
             '{"summary": "ok", "change_groups": []}',
@@ -197,6 +203,8 @@ class TestReviewEngine:
         """All 3 walkthrough attempts failing leaves walkthrough=None but the
         review itself still completes."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.walkthrough = AsyncMock(return_value="NOT VALID JSON {{{")
         llm.review = AsyncMock(
             return_value=json.dumps(
@@ -217,6 +225,8 @@ class TestReviewEngine:
     @pytest.mark.asyncio
     async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         no_comments = json.dumps(
             {
                 "comments": [],
@@ -260,6 +270,8 @@ class TestReviewEngine:
     async def test_noise_filtering_applied(self, sample_diff_text: str):
         """Verify that noise filtering reduces comments."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -344,6 +356,10 @@ class TestReviewEngine:
             return "NOT VALID JSON {{{"
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.walkthrough = AsyncMock(
             return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
@@ -446,9 +462,91 @@ class TestReviewEngine:
         assert result.walkthrough.summary != ""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("retry", [False, True])
+    @pytest.mark.parametrize("mode", ["diff", "pr"])
+    async def test_walkthrough_diagram_setting_is_enforced(
+        self, mock_llm, mock_provider, sample_diff_text, enabled, retry, mode
+    ):
+        response = json.loads(_WALKTHROUGH_LLM_RESPONSE)
+        response["sequence_diagram"] = 'graph LR\n  a["Input"] --> b["Output"]'
+        raw = json.dumps(response)
+        mock_llm.walkthrough.side_effect = ["{}", raw] if retry else [raw]
+        mock_provider.get_all_bot_threads.return_value = []
+        mock_provider.find_bot_comment.return_value = 42
+        config = MiraConfig()
+        config.review.walkthrough_sequence_diagram = enabled
+        config.review.security_pass = False
+        config.review.self_critique = False
+        config.review.include_summary = False
+        config.review.code_context = False
+        config.review.overlap.enabled = False
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+
+        result = (
+            await engine.review_diff(sample_diff_text)
+            if mode == "diff"
+            else await engine.review_pr("https://github.com/test/repo/pull/1")
+        )
+
+        assert result.walkthrough is not None
+        assert result.walkthrough.summary == response["summary"]
+        assert result.walkthrough.sequence_diagram == (
+            response["sequence_diagram"] if enabled else None
+        )
+        assert ("```mermaid" in result.walkthrough.to_markdown()) is enabled
+        assert mock_llm.walkthrough.await_count == (2 if retry else 1)
+        if mode == "pr":
+            bodies = [call.args[2] for call in mock_provider.update_comment.call_args_list]
+            progress = [body for body in bodies if "Code review in progress" in body]
+            assert progress
+            assert all(("```mermaid" in body) is enabled for body in progress)
+            assert "Code review in progress" not in bodies[-1]
+            assert ("```mermaid" in bodies[-1]) is enabled
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_response", ["{}", '{"summary":"Changes.</invoke>"}'])
+    async def test_walkthrough_retries_invalid_content(
+        self, mock_llm: LLMProvider, sample_diff_text: str, bad_response: str
+    ):
+        mock_llm.walkthrough.side_effect = [bad_response, _WALKTHROUGH_LLM_RESPONSE]
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm)
+
+        result = await engine.review_diff(sample_diff_text)
+
+        assert result.walkthrough is not None
+        assert result.walkthrough.summary == "PR walkthrough summary."
+        assert mock_llm.walkthrough.await_count == 2
+        retry_messages = mock_llm.walkthrough.call_args.args[0]
+        assert retry_messages[-1]["role"] == "user"
+        assert "non-empty summary" in retry_messages[-1]["content"]
+        assert result.reviewed_files > 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_walkthrough_finalizes_placeholder_with_notice(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        mock_llm.walkthrough.return_value = "{}"
+        mock_provider.find_bot_comment.return_value = 42
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+
+        result = await engine.review_pr("https://github.com/owner/repo/pull/42")
+
+        # The fork retries the walkthrough up to 3 times (corrupted tool-call
+        # arguments); upstream's corrective prompt rides on the first retry.
+        assert mock_llm.walkthrough.await_count == 3
+        assert result.walkthrough is None
+        assert result.reviewed_files > 0
+        bodies = [c.args[2] for c in mock_provider.update_comment.call_args_list]
+        assert any("Walkthrough was not generated." in body for body in bodies)
+        assert not any("files reviewed" in body for body in bodies)
+
+    @pytest.mark.asyncio
     async def test_walkthrough_disabled(self, sample_llm_response_text: str, sample_diff_text: str):
         """Walkthrough is skipped when disabled."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.review = AsyncMock(return_value=sample_llm_response_text)
         llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
         llm.complete = AsyncMock(return_value=sample_llm_response_text)
@@ -470,6 +568,8 @@ class TestReviewEngine:
     ):
         """Walkthrough failure does not block the review."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.walkthrough = AsyncMock(side_effect=RuntimeError("LLM exploded"))
         llm.review = AsyncMock(return_value=sample_llm_response_text)
         llm.complete = AsyncMock(return_value=sample_llm_response_text)
@@ -548,6 +648,31 @@ class TestReviewEngine:
         # No findings and LLM already scored low → leave as-is.
         assert wt.confidence_score.score == 1
         assert wt.confidence_score.label == "Major concerns"
+
+    def test_clamp_no_comments_says_no_issues(self):
+        wt = WalkthroughResult(
+            confidence_score=WalkthroughConfidenceScore(
+                score=4,
+                label="Safe with minor fixes",
+                reason="well tested",
+            ),
+        )
+        _clamp_confidence_to_findings(wt, [])
+        # Nothing survived filtering/self-critique: recompute from what posted.
+        assert wt.confidence_score.label == "No issues to flag"
+        assert wt.confidence_score.score == 5
+        assert wt.confidence_score.reason == "No issues found in the reviewed changes."
+
+    def test_clamp_comments_keep_llm_label(self):
+        wt = WalkthroughResult(
+            confidence_score=WalkthroughConfidenceScore(
+                score=4,
+                label="Safe with minor fixes",
+                reason="r",
+            ),
+        )
+        _clamp_confidence_to_findings(wt, [self._comment(Severity.SUGGESTION)])
+        assert wt.confidence_score.label == "Safe with minor fixes"
 
     def test_clamp_blocker_beats_warnings(self):
         wt = WalkthroughResult(
@@ -660,6 +785,34 @@ class TestReviewEngine:
         assert mock_provider.update_comment.call_count >= 1
 
     @pytest.mark.asyncio
+    async def test_placeholder_finalized_when_walkthrough_post_fails(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """If the final walkthrough can't be posted (e.g. the host rejects the
+        body), the placeholder is replaced with a short note rather than left on
+        an in-progress state, and the review still completes."""
+        mock_provider.find_bot_comment = AsyncMock(return_value=7)
+        bodies: list[str] = []
+
+        async def update(pr_info, comment_id, body):  # noqa: ANN001, ANN202
+            bodies.append(body)
+            if "PR walkthrough summary" in body:
+                raise UnicodeEncodeError("utf-8", "\ud83d", 0, 1, "surrogates not allowed")
+
+        mock_provider.update_comment = AsyncMock(side_effect=update)
+
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert any("PR walkthrough summary" in b for b in bodies), "final walkthrough was tried"
+        final = bodies[-1]
+        assert "<!-- mira-walkthrough -->" in final
+        assert "walkthrough could not be posted" in final
+        assert "Reviewing this PR" not in final
+        assert "Code review in progress" not in final
+        mock_provider.post_review.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_placeholder_finalized_when_all_files_excluded(
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
@@ -723,6 +876,8 @@ class TestReviewEngine:
             }
         )
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
         llm.review = AsyncMock(return_value=no_comments_response)
         llm.complete = AsyncMock(return_value=no_comments_response)
@@ -770,6 +925,10 @@ class TestReviewEngine:
         )
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
         llm.review = AsyncMock(return_value=chunk_response)
@@ -811,6 +970,8 @@ class TestReviewEngine:
         """When _review_diff_internal raises, the placeholder comment is updated
         with a failure message before the exception propagates."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -862,6 +1023,8 @@ class TestReviewEngine:
         review failure must re-render it without the in-progress banner and
         append the failure notice — not wipe it, not leave it stuck."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=50)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -911,6 +1074,195 @@ class TestReviewEngine:
         assert "ValueError" in second_body
 
 
+class TestCheckRunLifecycle:
+    """`review_pr` starts a check run on the head commit and completes it
+    with success/failure (neutral when the walkthrough is missing)."""
+
+    def _engine(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock, *, dry_run: bool = False
+    ) -> ReviewEngine:
+        return ReviewEngine(
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=mock_provider,
+            dry_run=dry_run,
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_pr_starts_and_completes_check_run(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.start_check_run.assert_awaited_once()
+        start_kwargs = mock_provider.start_check_run.await_args.kwargs
+        assert start_kwargs["details_url"] == pr_info.url
+        assert "In Progress" in start_kwargs["title"]
+        mock_provider.finish_check_run.assert_awaited_once()
+        finish = mock_provider.finish_check_run.await_args
+        assert finish.args[1] == 42
+        assert finish.args[2] == "success"
+        # The expandable DETAILS section carries the review stats.
+        details = finish.kwargs["details"]
+        assert "2 files reviewed" in details
+        assert "3 comments" in details
+        # 1 fixture blocker (eval) + the secrets scanner blocking the
+        # hard-coded API key in the fixture diff, leaving 1 warning.
+        assert "2 blockers" in details
+        assert "1 warning" in details
+
+    @pytest.mark.asyncio
+    async def test_review_pr_completes_check_run_with_failure_on_error(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_pr_diff.side_effect = RuntimeError("boom")
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        with pytest.raises(RuntimeError, match="boom"):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.finish_check_run.assert_awaited_once()
+        finish = mock_provider.finish_check_run.await_args
+        assert finish.args[1] == 42
+        assert finish.args[2] == "failure"
+        # No result on a failed review → nothing to show in DETAILS.
+        assert finish.kwargs["details"] == ""
+
+    @pytest.mark.asyncio
+    async def test_review_pr_dry_run_skips_check_runs(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.post_review = AsyncMock()
+
+        engine = self._engine(mock_llm, mock_provider, dry_run=True)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.start_check_run.assert_not_awaited()
+        mock_provider.finish_check_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_review_pr_completes_check_run_neutral_without_walkthrough(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A completed review whose walkthrough is missing → neutral, not failure."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+        mock_llm.walkthrough = AsyncMock(side_effect=RuntimeError("walkthrough down"))
+
+        engine = self._engine(mock_llm, mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "neutral"
+
+    @pytest.mark.asyncio
+    async def test_review_pr_disabled_walkthrough_not_neutral(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A disabled (not failed) missing walkthrough is a plain success."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+        mock_llm.walkthrough = AsyncMock(side_effect=RuntimeError("irrelevant"))
+
+        config = MiraConfig()
+        config.review.walkthrough = False
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "success"
+
+    @pytest.mark.asyncio
+    async def test_review_pr_empty_diff_skip_not_neutral(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A walkthrough-enabled review skipped on an empty diff is a plain
+        success — no generation was ever attempted."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.get_pr_diff.return_value = ""
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        assert result.skipped_reason is not None
+        assert result.walkthrough is None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "success"
+
+    @pytest.mark.asyncio
+    async def test_review_pr_all_files_filtered_skip_not_neutral(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A walkthrough-enabled review where every file is excluded by the
+        filters is a plain success — no generation was ever attempted."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        mock_provider.get_pr_diff.return_value = (
+            "diff --git a/poetry.lock b/poetry.lock\n"
+            "--- a/poetry.lock\n"
+            "+++ b/poetry.lock\n"
+            "@@ -1,1 +1,2 @@\n"
+            " line\n"
+            "+new\n"
+        )
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+
+        engine = self._engine(mock_llm, mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result is not None
+        assert result.skipped_reason is not None
+        assert result.walkthrough is None
+        mock_provider.finish_check_run.assert_awaited_once()
+        assert mock_provider.finish_check_run.await_args.args[2] == "success"
+
+    @pytest.mark.asyncio
+    async def test_check_run_provider_errors_never_fail_the_review(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """Provider exceptions in start/finish are logged, not raised."""
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+
+        # Failed start: review still succeeds; nothing to finish afterwards.
+        mock_provider.start_check_run = AsyncMock(side_effect=ProviderError("start boom"))
+        mock_provider.finish_check_run = AsyncMock()
+        engine = self._engine(mock_llm, mock_provider)
+        assert await engine.review_pr("https://github.com/test/repo/pull/1") is not None
+        mock_provider.start_check_run.assert_awaited_once()
+        mock_provider.finish_check_run.assert_not_awaited()
+
+        # Failed finish: review still succeeds.
+        mock_provider.reset_mock()
+        mock_provider.start_check_run = AsyncMock(return_value=42)
+        mock_provider.finish_check_run = AsyncMock(side_effect=ProviderError("finish boom"))
+        assert await engine.review_pr("https://github.com/test/repo/pull/1") is not None
+        mock_provider.finish_check_run.assert_awaited_once()
+
+
 class TestDryRun:
     """Tests for dry-run mode — full pipeline without write operations."""
 
@@ -954,6 +1306,10 @@ class TestDryRun:
         provider.find_bot_comment = AsyncMock(return_value=None)
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -962,6 +1318,7 @@ class TestDryRun:
             return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
         )
         llm.review = AsyncMock(return_value=sample_llm_response_text)
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
             config=MiraConfig(), llm=llm, provider=provider, bot_name="mira", dry_run=True
@@ -1069,6 +1426,10 @@ class TestThreadResolution:
         )
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1077,6 +1438,7 @@ class TestThreadResolution:
             return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
         )
         llm.review = AsyncMock(return_value=sample_llm_response_text)
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
             config=MiraConfig(), llm=llm, provider=provider_with_threads, bot_name="mira"
@@ -1098,6 +1460,8 @@ class TestThreadResolution:
     ):
         """With auto_resolve_conversations off, no threads are fetched or resolved."""
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         llm.complete = AsyncMock(return_value=json.dumps({"results": []}))
@@ -1105,6 +1469,7 @@ class TestThreadResolution:
             return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
         )
         llm.review = AsyncMock(return_value=sample_llm_response_text)
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         config = MiraConfig()
         config.review.auto_resolve_conversations = False
@@ -1132,6 +1497,8 @@ class TestThreadResolution:
 
         verify_response = json.dumps({"results": []})
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1140,6 +1507,7 @@ class TestThreadResolution:
             return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
         )
         llm.review = AsyncMock(return_value=sample_llm_response_text)
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
             config=MiraConfig(), llm=llm, provider=provider_with_threads, bot_name="mira"
@@ -1167,6 +1535,10 @@ class TestThreadResolution:
         )
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1175,6 +1547,7 @@ class TestThreadResolution:
             return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
         )
         llm.review = AsyncMock(return_value=sample_llm_response_text)
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
             config=MiraConfig(), llm=llm, provider=provider_with_threads, bot_name="mira"
@@ -1308,6 +1681,8 @@ class TestRoundDetectionWiring:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
 
         captured: dict = {}
 
@@ -1368,6 +1743,8 @@ class TestRoundDetectionWiring:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
 
         captured: dict = {}
 
@@ -1418,6 +1795,8 @@ class TestRoundDetectionWiring:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
 
         captured: dict = {}
 
@@ -1475,6 +1854,8 @@ class TestIncrementalDiff:
         mock_provider.post_comment = AsyncMock()
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        mock_provider.start_check_run = AsyncMock(return_value=0)
+        mock_provider.finish_check_run = AsyncMock()
         return mock_provider
 
     @pytest.mark.asyncio
@@ -1760,6 +2141,10 @@ class TestSecurityReviewPass:
         from mira.core.passes import security_review_pass
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(return_value=canned)
 
         out = await security_review_pass(llm, files, files, "title")
@@ -1776,6 +2161,8 @@ class TestSecurityReviewPass:
 
         files = parse_diff(sample_diff_text).files
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(side_effect=RuntimeError("LLM down"))
 
         out = await security_review_pass(llm, files, files, "title")
@@ -1855,6 +2242,10 @@ class TestSecurityReviewPass:
         canned = json.dumps({"comments": [], "summary": "", "metadata": {"reviewed_files": 1}})
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(return_value=canned)
         llm.count_tokens = MagicMock(return_value=100)
 
@@ -1892,6 +2283,10 @@ index 1111111..2222222 100644
         from mira.core.passes import dependency_review_pass
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock()
 
         out = await dependency_review_pass(llm, [], ["react-table"], "title")
@@ -1924,6 +2319,8 @@ index 1111111..2222222 100644
             }
         )
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(return_value=canned)
 
         out = await dependency_review_pass(llm, files, ["react-table", "react"], "title")
@@ -1939,6 +2336,8 @@ index 1111111..2222222 100644
 
         files = parse_diff(self._MANIFEST_DIFF).files
         llm = MagicMock(spec=LLMProvider)
+        # No tool calls: the agentic loop exits and the forced review runs.
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.complete_with_tools = AsyncMock(side_effect=RuntimeError("LLM down"))
 
         out = await dependency_review_pass(llm, files, ["react-table"], "title")
@@ -2596,6 +2995,10 @@ class TestAgenticSecurityPass(TestAgenticToolsOnIndexedRepos):
         monkeypatch.setattr("mira.core.passes.agentic_review_loop", loop_mock)
 
         llm = MagicMock(spec=LLMProvider)
+
+        # No tool calls: the agentic loop exits and the forced review runs.
+
+        llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
         llm.count_tokens = MagicMock(return_value=100)
         llm.complete_with_tools = AsyncMock(return_value=self._SECURITY_CANNED)
 
