@@ -78,6 +78,9 @@ class LLMConfig(BaseModel):
     request_timeout: int = Field(default=120, ge=1)
     retry_min_wait: int = Field(default=2, ge=0)
     retry_max_wait: int = Field(default=30, ge=0)
+    # Send Anthropic prompt-cache breakpoints when the endpoint's provider
+    # profile supports them (OpenRouter) and the model is anthropic/*.
+    prompt_caching: bool = True
     # Codex CLI provider settings. Auth is handled by Codex itself through
     # CODEX_HOME/auth.json from `codex login`; Mira does not need an OpenAI API key.
     codex_command: str = "codex"
@@ -239,6 +242,10 @@ class ReviewConfig(BaseModel):
     # listed as skipped.
     max_chunks_per_review: int = Field(default=5, ge=1, le=20)
     include_summary: bool = True
+    # List findings the self-critique graded "plausible" but did not post in a
+    # collapsed "Worth a look (not verified)" walkthrough section (max 5).
+    # Never inline, never in key issues. Off by default.
+    show_unverified_findings: bool = False
     focus_only_on_problems: bool = False
     walkthrough: bool = True
     walkthrough_sequence_diagram: bool = True
@@ -303,6 +310,21 @@ class ReviewConfig(BaseModel):
     # index context. Disable to force single-shot reviews (cheaper, less
     # thorough).
     agentic_tools: bool = True
+
+    # Investigation turns the reviewer gets per chunk before it is asked to
+    # submit. Each turn is one model call that may issue several tool calls.
+    # The submission is always forced over the full investigation transcript
+    # when the budget runs out, so a low cap costs depth, never the review.
+    agentic_max_hops: int = Field(default=10, ge=1, le=30)
+
+    # After the reviewer submits, ask it once more — over the same transcript —
+    # for the concrete defects it analysed but withheld as minor or uncertain,
+    # and append them. One extra model call per chunk (prompt-cached by most
+    # providers). On the five-PR sample it raised recall (50% → 56-59% pooled
+    # over two flash models) at a precision cost that left F1 flat, and added
+    # ~25 s per DeepSeek review, so it is the opt-in "thorough" setting, like
+    # ensemble_runs, rather than the default.
+    second_look: bool = False
 
     # Whether the JIT cross-file resolver should attempt Java + Go imports.
     # Resolution for those languages is heuristic (we can't see the build

@@ -100,8 +100,19 @@ class CLIProviderBase:
             parts.append(f"\n### Message {i}: {role}\n{content}")
         return "\n".join(parts)
 
-    def _tool_prompt(self, messages: list[dict], tools: list[dict]) -> str:
+    def _tool_prompt(
+        self, messages: list[dict], tools: list[dict], force_tool: str | None = None
+    ) -> str:
         tool = tools[0].get("function", {}) if tools else {}
+        if force_tool:
+            tool = next(
+                (
+                    t.get("function", {})
+                    for t in tools
+                    if t.get("function", {}).get("name") == force_tool
+                ),
+                tool,
+            )
         tool_name = tool.get("name") or "submit_result"
         schema = tool.get("parameters") or {"type": "object"}
         return (
@@ -189,8 +200,9 @@ class CLIProviderBase:
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
-        prompt = self._tool_prompt(messages, tools)
+        prompt = self._tool_prompt(messages, tools, force_tool=force_tool)
         raw = await self._run(prompt)
         result = self._extract_json_object(raw)
         self._record_estimated_usage(prompt, result)
