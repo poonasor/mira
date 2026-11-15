@@ -264,6 +264,12 @@ class _ReviewLLM:
         return '{"comments": [], "summary": "", "metadata": {"reviewed_files": 1}}'
 
     async def review(self, messages, temperature=None):
+        # A chunk that fails agentically also fails the plain-review fallback,
+        # so these tests still exercise the "chunk really failed" path.
+        if self._failing_path(messages) is not None:
+            raise StructuredOutputError(
+                "structured_output", model="m", tool="submit_review", excerpt="prose review"
+            )
         return '{"comments": [], "summary": "", "metadata": {"reviewed_files": 0}}'
 
     async def complete(self, messages, json_mode=True, temperature=None, max_tokens=None):
@@ -485,3 +491,94 @@ def test_response_excerpt_is_bounded_and_single_line():
     excerpt = _response_excerpt("secret\n" + "x" * 1000)
     assert "\n" not in excerpt
     assert len(excerpt) <= 301
+
+
+# --- fallback to a single review call when the agentic pass output is unusable ---
+
+_NO_PATH_RESPONSE = (
+    '{"comments": [{"line": 3, "body": "missing path", "agent_prompt": "x"}], '
+    '"summary": "s", "metadata": {"reviewed_files": 1}}'
+)
+_GOOD_RESPONSE = (
+    '{"comments": [{"path": "src/a.py", "line": 1, "body": "real finding", '
+    '"severity": "warning", "confidence": 0.9}], "summary": "s", '
+    '"metadata": {"reviewed_files": 1}}'
+)
+
+
+class _ParseFailLLM(_ReviewLLM):
+    """Agentic pass returns comments without a path; plain review is scripted."""
+
+    def __init__(self, review_text) -> None:
+        super().__init__(set())
+        self._review_text = review_text
+        self.review_calls = 0
+
+    async def complete_agentic(self, messages, tools):
+        return _submit(json.loads(_NO_PATH_RESPONSE))
+
+    async def review(self, messages, temperature=None):
+        self.review_calls += 1
+        if isinstance(self._review_text, Exception):
+            raise self._review_text
+        return self._review_text
+
+
+@pytest.mark.asyncio
+async def test_unparseable_agentic_output_falls_back_to_single_review(monkeypatch, tmp_path):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    llm = _ParseFailLLM(_GOOD_RESPONSE)
+    engine = _engine(llm)
+    engine._agentic_source_fetcher = _FakeFetcher()
+    engine._agentic_repo_tree = ["src/a.py"]
+
+    result = await engine.review_diff(_diff("src/a.py"))
+
+    assert result.failed_chunks == []
+    assert llm.review_calls == 1
+    assert [c.path for c in result.comments] == ["src/a.py"]
+
+
+@pytest.mark.asyncio
+async def test_salvage_keeps_valid_comments_when_fallback_also_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    mixed = json.dumps(
+        {
+            "comments": [
+                {"line": 3, "body": "no path"},
+                {"path": "src/a.py", "line": 1, "body": "kept", "confidence": 0.9},
+            ],
+            "summary": "s",
+            "metadata": {"reviewed_files": 1},
+        }
+    )
+
+    class _Mixed(_ParseFailLLM):
+        async def complete_agentic(self, messages, tools):
+            return _submit(json.loads(mixed))
+
+    llm = _Mixed(StructuredOutputError("structured_output", model="m", tool="t", excerpt="x"))
+    engine = _engine(llm)
+    engine._agentic_source_fetcher = _FakeFetcher()
+    engine._agentic_repo_tree = ["src/a.py"]
+
+    result = await engine.review_diff(_diff("src/a.py"))
+
+    assert result.failed_chunks == []
+    assert [c.path for c in result.comments] == ["src/a.py"]
+
+
+@pytest.mark.asyncio
+async def test_chunk_still_fails_when_fallback_and_salvage_both_fail(monkeypatch, tmp_path):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    llm = _ParseFailLLM(
+        StructuredOutputError("structured_output", model="m", tool="t", excerpt="x")
+    )
+    engine = _engine(llm)
+    engine._agentic_source_fetcher = _FakeFetcher()
+    engine._agentic_repo_tree = ["src/a.py"]
+
+    result = await engine.review_diff(_diff("src/a.py"))
+
+    assert len(result.failed_chunks) == 1
+    assert llm.review_calls == 1

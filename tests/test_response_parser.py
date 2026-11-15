@@ -449,3 +449,29 @@ class TestSuggestionWithoutBody:
         response = parse_llm_response(data)
         comments = convert_to_review_comments(response, valid_paths={"a.py"})
         assert len(comments) == 1
+
+
+class TestSalvage:
+    _MIXED = json.dumps(
+        {
+            "comments": [
+                {"line": 3, "body": "no path"},
+                {"path": "a.py", "line": 1, "body": "ok"},
+            ],
+            "summary": "s",
+        }
+    )
+
+    def test_strict_rejects_comment_without_path(self):
+        with pytest.raises(ResponseParseError):
+            parse_llm_response(self._MIXED)
+
+    def test_salvage_keeps_valid_comments(self):
+        result = parse_llm_response(self._MIXED, salvage=True)
+        assert [c.path for c in result.comments] == ["a.py"]
+        assert result.summary == "s"
+
+    def test_salvage_raises_when_nothing_valid(self):
+        raw = json.dumps({"comments": [{"line": 1, "body": "x"}], "summary": "s"})
+        with pytest.raises(ResponseParseError):
+            parse_llm_response(raw, salvage=True)
