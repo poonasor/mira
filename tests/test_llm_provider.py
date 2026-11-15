@@ -1179,19 +1179,19 @@ class TestMalformedToolArguments:
         assert cause._code == "malformed_tool_arguments"
 
     @pytest.mark.asyncio
-    async def test_corrupted_content_fallback_also_raises(self):
+    async def test_corrupted_tool_call_arguments_raise_but_content_fallback_is_tolerated(self):
+        # Upstream contract (v2.8 sync): prose returned instead of a tool call is
+        # tolerated in the non-forced path; only TOOL-CALL arguments are
+        # JSON-validated. The forced path still raises StructuredOutputError on
+        # prose (tested above via StructuredOutputError).
         provider = LLMProvider(LLMConfig(model="glm-5.2"))
-        # Content fallback path: no tool_calls, prose content instead.
-        bad = _mock_httpx_response({"choices": [{"message": {"content": "NOT JSON {{{"}}]})
-
-        with (
-            patch("mira.llm.provider.httpx.AsyncClient") as cls,
-            pytest.raises(LLMError),
-        ):
-            cls.return_value = self._client([bad])
-            await provider.complete_with_tools(
+        prose = _mock_httpx_response({"choices": [{"message": {"content": "NOT JSON {{{"}}]})
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([prose])
+            result = await provider.complete_with_tools(
                 [{"role": "user", "content": "hi"}], tools=[self._TOOL]
             )
+        assert result == "NOT JSON {{{"
 
     @pytest.mark.asyncio
     async def test_valid_arguments_pass_through(self):

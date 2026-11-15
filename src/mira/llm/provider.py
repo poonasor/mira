@@ -276,7 +276,9 @@ class LLMProvider(OpenAICompatibleProvider):
         content = message.get("content") or ""
         if content:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return validate_tool_arguments(content, provider=self.config.provider, model=api_model)
+            # Not JSON-validated: prose fallback is the caller's accepted shape.
+            # The corruption guard only covers tool-call arguments.
+            return content
 
         # Neither a tool call nor content. Carry the response shape on the
         # error's full message — counts only, never reasoning text.
