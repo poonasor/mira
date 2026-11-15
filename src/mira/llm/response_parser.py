@@ -140,8 +140,14 @@ def validate_tool_arguments(raw: str, *, provider: str, model: str) -> str:
     return raw
 
 
-def parse_llm_response(raw_text: str) -> LLMReviewResponse:
-    """Parse raw LLM text output into a validated LLMReviewResponse."""
+def parse_llm_response(raw_text: str, *, salvage: bool = False) -> LLMReviewResponse:
+    """Parse raw LLM text output into a validated LLMReviewResponse.
+
+    With ``salvage=True`` (last resort, after a fallback review also failed),
+    comments that fail validation (e.g. a weaker model omitting ``path``) are
+    dropped one by one instead of failing the whole chunk. If comments were
+    present and none validate, it still raises ``ResponseParseError``.
+    """
     cleaned = strip_think_blocks(raw_text)
     cleaned = strip_code_fences(cleaned)
 
@@ -160,7 +166,39 @@ def parse_llm_response(raw_text: str) -> LLMReviewResponse:
     try:
         return LLMReviewResponse.model_validate(data)
     except Exception as e:
+        if salvage:
+            salvaged = _salvage_review_response(data)
+            if salvaged is not None:
+                return salvaged
         raise ResponseParseError(f"LLM response validation failed: {e}") from e
+
+
+def _salvage_review_response(data: dict) -> LLMReviewResponse | None:
+    """Keep the comments that validate; return None if nothing usable remains."""
+    raw_comments = data.get("comments")
+    if not isinstance(raw_comments, list) or not raw_comments:
+        return None
+    good: list[LLMComment] = []
+    for item in raw_comments:
+        try:
+            good.append(LLMComment.model_validate(item))
+        except Exception:
+            continue
+    if not good:
+        return None
+    logger.warning(
+        "Salvaged %d of %d review comments; dropped %d that failed validation",
+        len(good),
+        len(raw_comments),
+        len(raw_comments) - len(good),
+    )
+    rest = {k: v for k, v in data.items() if k != "comments"}
+    try:
+        return LLMReviewResponse.model_validate({**rest, "comments": []}).model_copy(
+            update={"comments": good}
+        )
+    except Exception:
+        return LLMReviewResponse(comments=good)
 
 
 def _build_diff_line_ranges(files: list[FileDiff]) -> dict[str, list[tuple[int, int]]]:
