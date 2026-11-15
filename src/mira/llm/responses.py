@@ -215,6 +215,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
         json_mode: bool,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        *,
+        omit_temperature: bool = False,
     ) -> str:
         """Make a single LLM call with retries against the /responses endpoint."""
         body: dict = {
@@ -227,6 +229,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
             body["text"] = {"format": {"type": "json_object"}}
             body["input"] = _ensure_json_hint(body["input"])
         self._apply_reasoning(body, protocol="responses")
+        if omit_temperature:
+            body.pop("temperature", None)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(

@@ -6,7 +6,7 @@ import ipaddress
 import logging
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 import yaml
@@ -15,6 +15,10 @@ from pydantic import BaseModel, Field, field_validator
 from mira.exceptions import ConfigError
 
 logger = logging.getLogger(__name__)
+
+IndexingTemperature = (
+    Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] | Literal["omit"]
+)
 
 # `.mira.yaml` is the canonical per-repo override filename. `.mira.yaml`
 # is accepted for backward compat with repos that committed it before the
@@ -54,6 +58,7 @@ class LLMConfig(BaseModel):
     review_reasoning_effort: str | None = None
     reasoning_effort: str | None = None
     temperature: float = 0.2
+    indexing_temperature: IndexingTemperature = 0.0
     # Output budget per call. Thinking tokens count against it on most
     # providers, so it is sized for a medium-effort review of a large chunk;
     # an endpoint that rejects it is retried at 4096 and remembered.
@@ -175,6 +180,41 @@ class FilterConfig(BaseModel):
     # stripped by the dispatcher check so that `dependabot` here matches
     # `dependabot[bot]` in a webhook payload.
     blocked_authors: list[str] = Field(default_factory=list)
+    # Auto-review only PRs whose destination (base/target) branch matches one
+    # of these glob patterns — e.g. ["main", "release/*"] reviews PRs into
+    # main and release branches only. Empty (default) = review every branch.
+    # Manual `@bot review` commands are not affected.
+    allowed_base_branches: list[str] = Field(default_factory=list)
+    # Per-repo replacement for allowed_base_branches, keyed "owner/repo"
+    # (case-insensitive). An override replaces the deployment default for
+    # that repo; [] disables auto-review there.
+    allowed_base_branch_overrides: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("allowed_base_branches")
+    @classmethod
+    def _validate_base_branches(cls, v: list[str]) -> list[str]:
+        from mira.platforms.base_branch_policy import validate_patterns
+
+        return validate_patterns(v)
+
+    @field_validator("allowed_base_branch_overrides")
+    @classmethod
+    def _validate_base_branch_overrides(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        from mira.platforms.base_branch_policy import validate_patterns
+
+        for repo_full, patterns in v.items():
+            # At least two non-empty segments, none containing whitespace —
+            # `owner/repo` or a nested GitLab namespace like
+            # `group/subgroup/repo`. `owner/` or `/repo` can only be a typo,
+            # and would silently leave that repo on the deployment default.
+            parts = repo_full.split("/") if isinstance(repo_full, str) else []
+            if len(parts) < 2 or any(not p or p.split() != [p] for p in parts):
+                raise ValueError(
+                    f"allowed_base_branch_overrides keys must be 'owner/repo' "
+                    f"(or a nested namespace), got {repo_full!r}"
+                )
+            v[repo_full] = validate_patterns(patterns)
+        return v
 
 
 class CommandOverrideConfig(BaseModel):
@@ -494,6 +534,7 @@ def load_config(
     overrides: dict[str, Any] | None = None,
     *,
     trust_execution_settings: bool = False,
+    use_dashboard: bool = True,
 ) -> MiraConfig:
     """Load config, layering global defaults → per-repo `.mira.yaml` → overrides.
 
@@ -510,17 +551,17 @@ def load_config(
     """
     data: dict[str, Any] = _deep_merge({}, _global_defaults)
 
-    # Lazy import + broad except: this function runs in CLI / test contexts
-    # that have no DB attached. A DB error must never block a review.
-    try:
-        from mira.dashboard.api import _app_db
+    if use_dashboard:
+        # A DB error must never block a review.
+        try:
+            from mira.dashboard.api import _app_db
 
-        if _app_db is not None:
-            db_overrides = _app_db.get_global_review_overrides()
-            if db_overrides:
-                data = _deep_merge(data, db_overrides)
-    except Exception as _db_exc:  # noqa: BLE001
-        logger.debug("load_config: skipping DB overrides (%s)", _db_exc)
+            if _app_db is not None:
+                db_overrides = _app_db.get_global_review_overrides()
+                if db_overrides:
+                    data = _deep_merge(data, db_overrides)
+        except Exception as _db_exc:  # noqa: BLE001
+            logger.debug("load_config: skipping DB overrides (%s)", _db_exc)
 
     if config_path is not None:
         path = Path(config_path)
