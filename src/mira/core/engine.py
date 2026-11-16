@@ -1552,6 +1552,14 @@ class ReviewEngine:
                 summary="No files were selected for review.",
                 skipped_reason="All files exceeded size limits or were deprioritized.",
             )
+        if not any(f.hunks for f in selected):
+            return ReviewResult(
+                summary="No line changes to review.",
+                skipped_reason=(
+                    "No line changes to review: the diff has no hunks (renames, "
+                    "empty files, mode changes, or patches the host did not return)."
+                ),
+            )
 
         all_paths = [f.path for f in filtered]
         selected_paths = [f.path for f in selected]
@@ -1900,8 +1908,10 @@ class ReviewEngine:
                         team_conventions=team_conventions,
                     )
 
-                    def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
-                        parsed = parse_llm_response(raw)
+                    def _parse(
+                        raw: str, salvage: bool = False
+                    ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
+                        parsed = parse_llm_response(raw, salvage=salvage)
                         return (
                             convert_to_review_comments(
                                 parsed,
@@ -1955,6 +1965,35 @@ class ReviewEngine:
                     else:
                         raw_response = await self.llm.review(messages)
 
+                    async def _single_review_fallback(why: str) -> str:
+                        # The agentic pass can only run on the z.ai tier; when it
+                        # returns nothing usable (quota out, or a weak model
+                        # dropping required fields) retry the chunk once as a
+                        # plain forced review, which the primary tier serves.
+                        logger.warning(
+                            "Chunk %d/%d %s; retrying once as a single review call",
+                            idx + 1,
+                            len(chunks),
+                            why,
+                        )
+                        try:
+                            return await self.llm.review(messages) or ""
+                        except Exception as fb_exc:  # noqa: BLE001
+                            logger.warning(
+                                "Chunk %d/%d fallback review failed: %s",
+                                idx + 1,
+                                len(chunks),
+                                fb_exc,
+                            )
+                            return ""
+
+                    fallback_tried = False
+                    if not raw_response:
+                        raw_response = await _single_review_fallback(
+                            "produced no structured review"
+                        )
+                        fallback_tried = True
+
                     if not raw_response:
                         logger.warning(
                             "Chunk %d/%d produced no structured review",
@@ -1981,15 +2020,40 @@ class ReviewEngine:
                             exc,
                             excerpt,
                         )
-                        return _ChunkOutcome(
-                            failure=_chunk_failure(
-                                idx,
-                                chunk,
-                                "response parse error",
-                                hops=hops,
-                                excerpt=raw_response,
+                        parsed_ok = False
+                        if not fallback_tried:
+                            fallback_tried = True
+                            fb_raw = await _single_review_fallback("failed to parse")
+                            if fb_raw:
+                                try:
+                                    comments, key_issues, summary_text = _parse(fb_raw)
+                                    raw_response = fb_raw
+                                    parsed_ok = True
+                                except ResponseParseError as fb_exc:
+                                    logger.warning(
+                                        "Chunk %d/%d fallback also failed to parse: %s",
+                                        idx + 1,
+                                        len(chunks),
+                                        fb_exc,
+                                    )
+                        if not parsed_ok:
+                            try:
+                                comments, key_issues, summary_text = _parse(
+                                    raw_response, salvage=True
+                                )
+                                parsed_ok = True
+                            except ResponseParseError:
+                                pass
+                        if not parsed_ok:
+                            return _ChunkOutcome(
+                                failure=_chunk_failure(
+                                    idx,
+                                    chunk,
+                                    "response parse error",
+                                    hops=hops,
+                                    excerpt=raw_response,
+                                )
                             )
-                        )
 
                     # Ensemble: fire the extra runs in parallel and keep
                     # majority-vote findings. The agentic loop (if any) only
