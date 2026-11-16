@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from mira.core.git_snapshot import GitSnapshot
     from mira.llm.base import LLMProviderProtocol
 
 from mira.analysis.severity import classify_severity
@@ -37,7 +38,7 @@ from mira.core.threads import (
     thread_title,
 )
 from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
-from mira.index.context import build_code_context
+from mira.index.context import SourceFetcher, build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
 from mira.llm.prompts.review import (
@@ -611,7 +612,7 @@ class ReviewEngine:
         # Only the latter drives the user-visible "your repo isn't indexed" nudge.
         self._jit_needed = False
         self._index_was_empty = False
-        self._agentic_source_fetcher: object | None = None
+        self._agentic_source_fetcher: SourceFetcher | None = None
         self._agentic_repo_tree: list[str] = []
 
     async def _post_placeholder_comment(self, pr_info: PRInfo) -> int | None:
@@ -1486,9 +1487,11 @@ class ReviewEngine:
 
         return result
 
-    async def review_diff(self, diff_text: str) -> ReviewResult:
-        """Review a diff from stdin — no provider needed."""
-        return await self._review_diff_internal(diff_text)
+    async def review_diff(
+        self, diff_text: str, *, local_snapshot: GitSnapshot | None = None
+    ) -> ReviewResult:
+        """Review a diff without a Git hosting provider."""
+        return await self._review_diff_internal(diff_text, local_snapshot=local_snapshot)
 
     async def _review_diff_internal(
         self,
@@ -1501,6 +1504,7 @@ class ReviewEngine:
         resolved_threads: list[dict] | None = None,
         team_conventions: str = "",
         walkthrough_diff_text: str | None = None,
+        local_snapshot: GitSnapshot | None = None,
     ) -> ReviewResult:
         """Core review pipeline.
 
@@ -1548,6 +1552,14 @@ class ReviewEngine:
                 summary="No files were selected for review.",
                 skipped_reason="All files exceeded size limits or were deprioritized.",
             )
+        if not any(f.hunks for f in selected):
+            return ReviewResult(
+                summary="No line changes to review.",
+                skipped_reason=(
+                    "No line changes to review: the diff has no hunks (renames, "
+                    "empty files, mode changes, or patches the host did not return)."
+                ),
+            )
 
         all_paths = [f.path for f in filtered]
         selected_paths = [f.path for f in selected]
@@ -1574,6 +1586,9 @@ class ReviewEngine:
         )
 
         filtered = selected
+
+        if local_snapshot is not None:
+            team_conventions = await local_snapshot.conventions()
 
         # The walkthrough prompt carries only paths, change types and hunk
         # headers, so describing the whole PR stays cheap on a large one. The
@@ -1652,7 +1667,7 @@ class ReviewEngine:
                 return None
 
         async def _build_context() -> str:
-            if not self.config.review.code_context:
+            if local_snapshot is not None or not self.config.review.code_context:
                 return ""
             try:
                 pr_info = getattr(self, "_pr_info", None)
@@ -1784,6 +1799,11 @@ class ReviewEngine:
             _build_context(),
             _fetch_file_history(),
         )
+        source_fetcher = self._agentic_source_fetcher
+        repo_tree = self._agentic_repo_tree
+        if local_snapshot is not None:
+            source_fetcher = local_snapshot if self.config.review.code_context else None
+            repo_tree = local_snapshot.paths()
 
         expanded = expand_context(filtered, self.config.review.context_lines)
 
@@ -1888,8 +1908,10 @@ class ReviewEngine:
                         team_conventions=team_conventions,
                     )
 
-                    def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
-                        parsed = parse_llm_response(raw)
+                    def _parse(
+                        raw: str, salvage: bool = False
+                    ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
+                        parsed = parse_llm_response(raw, salvage=salvage)
                         return (
                             convert_to_review_comments(
                                 parsed,
@@ -1903,16 +1925,12 @@ class ReviewEngine:
                             parsed.summary or "",
                         )
 
-                    use_agentic = (
-                        self.config.review.agentic_tools
-                        and self._agentic_source_fetcher is not None
-                    )
-                    if use_agentic:
+                    if self.config.review.agentic_tools and source_fetcher is not None:
                         from mira.llm.agentic_tools import AgenticToolExecutor
 
                         executor = AgenticToolExecutor(
-                            source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
-                            repo_tree=list(self._agentic_repo_tree),
+                            source_fetcher=source_fetcher,
+                            repo_tree=list(repo_tree),
                             changed_paths=[f.path for f in filtered],
                         )
                         loop_result = await agentic_review_loop(
@@ -1947,6 +1965,35 @@ class ReviewEngine:
                     else:
                         raw_response = await self.llm.review(messages)
 
+                    async def _single_review_fallback(why: str) -> str:
+                        # The agentic pass can only run on the z.ai tier; when it
+                        # returns nothing usable (quota out, or a weak model
+                        # dropping required fields) retry the chunk once as a
+                        # plain forced review, which the primary tier serves.
+                        logger.warning(
+                            "Chunk %d/%d %s; retrying once as a single review call",
+                            idx + 1,
+                            len(chunks),
+                            why,
+                        )
+                        try:
+                            return await self.llm.review(messages) or ""
+                        except Exception as fb_exc:  # noqa: BLE001
+                            logger.warning(
+                                "Chunk %d/%d fallback review failed: %s",
+                                idx + 1,
+                                len(chunks),
+                                fb_exc,
+                            )
+                            return ""
+
+                    fallback_tried = False
+                    if not raw_response:
+                        raw_response = await _single_review_fallback(
+                            "produced no structured review"
+                        )
+                        fallback_tried = True
+
                     if not raw_response:
                         logger.warning(
                             "Chunk %d/%d produced no structured review",
@@ -1973,15 +2020,40 @@ class ReviewEngine:
                             exc,
                             excerpt,
                         )
-                        return _ChunkOutcome(
-                            failure=_chunk_failure(
-                                idx,
-                                chunk,
-                                "response parse error",
-                                hops=hops,
-                                excerpt=raw_response,
+                        parsed_ok = False
+                        if not fallback_tried:
+                            fallback_tried = True
+                            fb_raw = await _single_review_fallback("failed to parse")
+                            if fb_raw:
+                                try:
+                                    comments, key_issues, summary_text = _parse(fb_raw)
+                                    raw_response = fb_raw
+                                    parsed_ok = True
+                                except ResponseParseError as fb_exc:
+                                    logger.warning(
+                                        "Chunk %d/%d fallback also failed to parse: %s",
+                                        idx + 1,
+                                        len(chunks),
+                                        fb_exc,
+                                    )
+                        if not parsed_ok:
+                            try:
+                                comments, key_issues, summary_text = _parse(
+                                    raw_response, salvage=True
+                                )
+                                parsed_ok = True
+                            except ResponseParseError:
+                                pass
+                        if not parsed_ok:
+                            return _ChunkOutcome(
+                                failure=_chunk_failure(
+                                    idx,
+                                    chunk,
+                                    "response parse error",
+                                    hops=hops,
+                                    excerpt=raw_response,
+                                )
                             )
-                        )
 
                     # Ensemble: fire the extra runs in parallel and keep
                     # majority-vote findings. The agentic loop (if any) only
@@ -2080,14 +2152,14 @@ class ReviewEngine:
         if (
             self.config.review.security_agentic
             and self.config.review.agentic_tools
-            and self._agentic_source_fetcher is not None
+            and source_fetcher is not None
         ):
             from mira.llm.agentic_tools import AgenticToolExecutor
 
             def _security_executor_factory() -> AgenticToolExecutor:
                 return AgenticToolExecutor(
-                    source_fetcher=self._agentic_source_fetcher,
-                    repo_tree=list(self._agentic_repo_tree),
+                    source_fetcher=source_fetcher,
+                    repo_tree=list(repo_tree),
                     changed_paths=[f.path for f in filtered],
                 )
 

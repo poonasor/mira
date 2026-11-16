@@ -24,6 +24,8 @@ from mira.dashboard.api import (
     FileModel,
     ImportEdge,
     PackageModel,
+    PackageVersionModel,
+    PackageVersionSourceModel,
     RepoBaseBranchPolicy,
     RepoDetail,
     RepoListItem,
@@ -36,7 +38,7 @@ from mira.dashboard.api import (
     logger,
     router,
 )
-from mira.index.store import IndexingSuperseded, IndexStore
+from mira.index.store import IndexingSuperseded, IndexStore, PackageManifestRow
 
 
 def _parse_base_branch_policy(raw: str) -> RepoBaseBranchPolicy | None:
@@ -393,35 +395,63 @@ def get_external_refs(owner: str, repo: str) -> list[ExternalRefModel]:
 
 @router.get("/api/repos/{owner:path}/{repo}/packages", response_model=list[PackageModel])
 def get_packages(owner: str, repo: str) -> list[PackageModel]:
-    """List dependencies parsed from manifest and lockfile files.
+    """List dependencies with their indexed versions and manifest sources.
 
-    When the same package appears in both a manifest (e.g. `pyproject.toml`
-    declaring `>=1.30`) and a lockfile (e.g. `uv.lock` resolving to
-    `1.99.5`), the lockfile entry wins — its concrete version is what's
-    actually installed.
+    The representative fields continue to prefer lockfiles. The versions
+    list also includes the declarations and their source paths.
     """
     from mira.index.manifests import _is_lockfile_path
 
     with _open_store(owner, repo) as store:
         rows = store.list_manifest_packages()
 
-    # Dedupe by (kind, name), preferring lockfile rows.
-    by_key: dict[tuple[str, str], PackageModel] = {}
+    by_key: dict[tuple[str, str], PackageManifestRow] = {}
+    sources_by_version: dict[tuple[str, str], dict[str, set[tuple[str, str, bool]]]] = {}
     for r in rows:
-        model = PackageModel(
-            name=r.name,
-            kind=r.kind,
-            version=r.version,
-            file_path=r.file_path,
-            is_dev=r.is_dev,
-        )
         key = (r.kind, r.name.lower())
+        sources_by_version.setdefault(key, {}).setdefault(r.version, set()).add(
+            (r.file_path, r.name, r.is_dev)
+        )
         existing = by_key.get(key)
-        if existing is None or (
-            _is_lockfile_path(r.file_path) and not _is_lockfile_path(existing.file_path)
+        if (
+            existing is None
+            or (_is_lockfile_path(r.file_path) and not _is_lockfile_path(existing.file_path))
+            # Prefer the last encountered version within one npm lockfile
+            # while the dashboard still shows one row per package.
+            or (
+                r.kind == "npm"
+                and r.name == existing.name
+                and r.file_path == existing.file_path
+                and r.id > existing.id
+            )
         ):
-            by_key[key] = model
-    return sorted(by_key.values(), key=lambda p: (p.kind, p.name.lower()))
+            by_key[key] = r
+    packages = []
+    for key, representative in sorted(by_key.items()):
+        sources = sources_by_version[key]
+        versions = [
+            PackageVersionModel(
+                version=version,
+                sources=[
+                    PackageVersionSourceModel(name=name, file_path=path, is_dev=is_dev)
+                    for path, name, is_dev in sorted(sources[version])
+                ],
+            )
+            for version in sorted(
+                sources, key=lambda value: (value != representative.version, value)
+            )
+        ]
+        packages.append(
+            PackageModel(
+                name=representative.name,
+                kind=representative.kind,
+                version=representative.version,
+                file_path=representative.file_path,
+                is_dev=representative.is_dev,
+                versions=versions,
+            )
+        )
+    return packages
 
 
 @router.post("/api/repos/{owner:path}/{repo}/index")

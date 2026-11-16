@@ -8,12 +8,32 @@ model there; this file picks it up automatically.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
-from mira.config import LLMConfig
+from pydantic import TypeAdapter, ValidationError
+
+from mira.config import IndexingTemperature, LLMConfig
 from mira.llm import provider_profiles as profiles
 from mira.llm import registry
 
 logger = logging.getLogger(__name__)
+_INDEXING_TEMPERATURE: TypeAdapter[IndexingTemperature] = TypeAdapter(IndexingTemperature)
+
+
+def resolve_indexing_temperature(
+    config: LLMConfig, db_value: str | None = None
+) -> tuple[IndexingTemperature, Literal["dashboard", "config"]]:
+    """Resolve a validated indexing temperature: DB → config → 0.0."""
+    if db_value:
+        try:
+            return _INDEXING_TEMPERATURE.validate_json(db_value), "dashboard"
+        except ValidationError:
+            logger.warning(
+                "Invalid saved indexing_temperature. Using deployment config. "
+                "Clear the override in Models settings."
+            )
+    return config.indexing_temperature, "config"
+
 
 MODEL_PRICING: dict[str, tuple[float, float]] = {
     model_id: registry.pricing(model_id) for model_id in registry.all_models()
@@ -153,7 +173,7 @@ def get_review_thinking_mode(config: LLMConfig, db_value: str | None = None) -> 
     return resolved
 
 
-def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
+def llm_config_for(purpose: str, base: LLMConfig, *, use_dashboard: bool = True) -> LLMConfig:
     """Return an LLMConfig with the appropriate model set for the given purpose.
 
     Reads the DB setting first (via _app_db), falls back to config fields.
@@ -166,30 +186,35 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     db_thinking: str | None = None
     db_review: str | None = None
     db_style: str | None = None
-    try:
-        from mira.dashboard.api import _app_db
+    db_temperature: str | None = None
+    if use_dashboard:
+        try:
+            from mira.dashboard.api import _app_db
 
-        if _app_db is not None:
-            if purpose == "indexing":
-                db_model = _app_db.get_setting("indexing_model")
-            elif purpose == "review":
-                db_model = _app_db.get_setting("review_model")
-                db_thinking = _app_db.get_setting("review_thinking_mode")
-            elif purpose == "security":
-                db_model = _app_db.get_setting("security_model")
-                db_thinking = _app_db.get_setting("review_thinking_mode")
-                db_review = _app_db.get_setting("review_model")
-            db_style = _app_db.get_setting("api_style")
-    except Exception:
-        pass  # DB not available — resolve from config fields alone
+            if _app_db is not None:
+                if purpose == "indexing":
+                    db_model = _app_db.get_setting("indexing_model")
+                    db_temperature = _app_db.get_setting("indexing_temperature")
+                elif purpose == "review":
+                    db_model = _app_db.get_setting("review_model")
+                    db_thinking = _app_db.get_setting("review_thinking_mode")
+                elif purpose == "security":
+                    db_model = _app_db.get_setting("security_model")
+                    db_thinking = _app_db.get_setting("review_thinking_mode")
+                    db_review = _app_db.get_setting("review_model")
+                db_style = _app_db.get_setting("api_style")
+        except Exception:
+            pass  # DB not available — resolve from config fields alone
 
     resolved = _resolve_for_purpose(
-        purpose, base, db_model, db_thinking, db_review, db_style, label=purpose.capitalize()
+        purpose, base, db_model, db_thinking, db_review, db_style,
+        db_temperature, label=purpose.capitalize()
     )
     if base.failover is None:
         return resolved
     failover = _resolve_for_purpose(
-        purpose, base.failover, None, None, None, None, label=f"{purpose.capitalize()} failover"
+        purpose, base.failover, None, None, None, None, None,
+        label=f"{purpose.capitalize()} failover"
     )
     return resolved.model_copy(update={"failover": failover})
 
@@ -201,6 +226,7 @@ def _resolve_for_purpose(
     db_thinking: str | None,
     db_review: str | None,
     db_style: str | None,
+    db_temperature: str | None = None,
     *,
     label: str,
 ) -> LLMConfig:
@@ -224,5 +250,14 @@ def _resolve_for_purpose(
     source = "dashboard setting" if db_model else ("mira.yaml" if config_model else "default")
     logger.info("%s model: %s (source: %s)", purpose.capitalize(), resolved, source)
     return base.model_copy(
-        update={"model": resolved, "reasoning_effort": thinking_mode, "api_style": resolved_style}
+        update={
+            "model": resolved,
+            "reasoning_effort": thinking_mode,
+            "api_style": resolved_style,
+            "indexing_temperature": (
+                resolve_indexing_temperature(base, db_temperature)[0]
+                if purpose == "indexing"
+                else base.indexing_temperature
+            ),
+        }
     )

@@ -202,9 +202,14 @@ class TieredProvider:
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
         result = await self._dispatch(
-            "complete_with_tools", messages, tools=tools, temperature=temperature
+            "complete_with_tools",
+            messages,
+            tools=tools,
+            temperature=temperature,
+            force_tool=force_tool,
         )
         return str(result)
 

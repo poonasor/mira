@@ -17,6 +17,7 @@ from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from mira.exceptions import ProviderError
+from mira import graphify_impact
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -505,6 +506,19 @@ class GitHubProvider(BaseProvider):
             review_body = f"**Mira Review Summary**\n\n{result.summary}"
         if result.key_issues:
             review_body += _format_key_issues(result.key_issues)
+
+        # Graphify impact annotation (2026-11-16): how much of the repo's
+        # dependency graph sits downstream of this PR. Read-only, fail-soft:
+        # no graph for this repo (or no /graphs mount) adds nothing and does
+        # not even fetch the PR file list (see mira.graphify_impact).
+        if review_body and graphify_impact.has_repo(pr_info.repo):
+            try:
+                changed_paths = await self.get_pr_files(
+                    pr_info.owner, pr_info.repo, pr_info.number)
+                review_body += graphify_impact.impact_section(
+                    pr_info.owner, pr_info.repo, changed_paths)
+            except Exception:  # noqa: BLE001
+                logger.debug("graphify impact annotation skipped", exc_info=True)
 
         token = await self._resolve_token()
         gh = self._make_client(token)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import Generator
@@ -12,8 +13,16 @@ from typing import Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+)
+from pydantic_core import InitErrorDetails
 
+from mira.config import IndexingTemperature
 from mira.dashboard.auth import AuthMiddleware, create_auth_router
 from mira.dashboard.db import AppDatabase, RepoRecord
 from mira.index.relationships import RelationshipStore
@@ -372,6 +381,9 @@ class ModelOption(BaseModel):
 
 class ModelsResponse(BaseModel):
     indexing_model: str
+    indexing_temperature: IndexingTemperature
+    indexing_temperature_source: str
+    config_indexing_temperature: IndexingTemperature
     review_model: str
     security_model: str
     backend: str  # "openrouter" | "zai" | "bedrock" | "codex-cli" | "openai-compatible"
@@ -396,10 +408,35 @@ class ModelsResponse(BaseModel):
 
 class ModelsUpdate(BaseModel):
     indexing_model: str
+    indexing_temperature: IndexingTemperature | None = None
     review_model: str
     security_model: str = ""
     review_thinking_mode: str = "off"
     api_style: str = "chat"
+
+    @field_validator("indexing_temperature", mode="wrap")
+    @classmethod
+    def _json_safe_temperature_errors(
+        cls, value: object, handler: ValidatorFunctionWrapHandler
+    ) -> IndexingTemperature | None:
+        try:
+            return handler(value)
+        except ValidationError as exc:
+            try:
+                json.dumps(exc.errors(), allow_nan=False)
+            except (TypeError, ValueError):
+                # FastAPI echoes invalid inputs, including nonfinite values in rejected containers.
+                errors = [
+                    InitErrorDetails(
+                        type=error["type"],
+                        loc=error["loc"],
+                        input=repr(error["input"]),
+                        ctx=error.get("ctx", {}),
+                    )
+                    for error in exc.errors()
+                ]
+                raise ValidationError.from_exception_data(cls.__name__, errors) from exc
+            raise
 
 
 class FailoverTierModel(BaseModel):
@@ -651,12 +688,24 @@ class BlastRadiusResponse(BaseModel):
     cross_repo: list[CrossRepoBlastEntry]  # other repos that depend on this one
 
 
+class PackageVersionSourceModel(BaseModel):
+    name: str
+    file_path: str
+    is_dev: bool
+
+
+class PackageVersionModel(BaseModel):
+    version: str
+    sources: list[PackageVersionSourceModel]
+
+
 class PackageModel(BaseModel):
     name: str
     kind: str  # "npm" | "pip" | "docker" | "go" | "rust" | "composer"
     version: str
     file_path: str
     is_dev: bool = False
+    versions: list[PackageVersionModel] = Field(default_factory=list)
 
 
 class PackageSearchHit(BaseModel):
@@ -929,8 +978,11 @@ async def refresh_contributors_repo(
 
 @router.get("/api/contributors/{login}", response_model=ContributorDetailModel)
 def get_contributor(login: str, request: Request, period: str = "") -> ContributorDetailModel:
-    """One contributor's aggregated stats, 365-day heatmap, per-repo breakdown,
-    and Mira review-quality signal (the quality fan-out mirrors /api/stats). Admin only."""
+    """A GitHub contributor's stats, 365-day heatmap, and per-repo breakdown.
+
+    Review quality is aggregated across GitHub repositories for this login.
+    Admin only.
+    """
     _require_admin(request)
     contributor = _app_db.get_contributor_by_login("github", login)
     if contributor is None:
@@ -980,6 +1032,8 @@ def get_contributor(login: str, request: Request, period: str = "") -> Contribut
     q = {"reviews": 0, "blockers": 0, "warnings": 0, "suggestions": 0}
     accepted = rejected = 0
     for repo_record in _app_db.list_repos():
+        if repo_record.platform != contributor.provider:
+            continue
         try:
             store = IndexStore.open(
                 repo_record.owner, repo_record.repo, platform=repo_record.platform

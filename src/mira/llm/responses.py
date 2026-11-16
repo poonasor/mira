@@ -215,6 +215,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
         json_mode: bool,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        *,
+        omit_temperature: bool = False,
     ) -> str:
         """Make a single LLM call with retries against the /responses endpoint."""
         body: dict = {
@@ -227,6 +229,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
             body["text"] = {"format": {"type": "json_object"}}
             body["input"] = _ensure_json_hint(body["input"])
         self._apply_reasoning(body, protocol="responses")
+        if omit_temperature:
+            body.pop("temperature", None)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await client.post(
@@ -362,7 +366,10 @@ class ResponsesProvider(OpenAICompatibleProvider):
         text = _output_text(data)
         if text:
             logger.warning("Model returned content instead of tool call, using content as fallback")
-            return validate_tool_arguments(text, provider=self.config.provider, model=api_model)
+            # Not validated as JSON: this is prose the caller treats as the
+            # response body. The corruption guard only covers tool-call
+            # arguments, where a forced tool call should have produced JSON.
+            return text
 
         # Neither a function call nor text. Carry the response shape on the
         # error's full message — counts only, never reasoning text.

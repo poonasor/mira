@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -303,6 +303,16 @@ def _build_file_summary(path: str, content: str, file_data: dict[str, Any]) -> F
     )
 
 
+def _indexing_temperature_kwargs(llm: Any) -> dict[str, Any]:
+    config = llm.config
+    if config.provider in {"bedrock", "codex-cli", "codex_cli", "codex"}:
+        # Bedrock uses the established 0.0 for summaries. Codex CLI manages sampling itself.
+        return {"temperature": 0.0}
+    if config.indexing_temperature == "omit":
+        return {"omit_temperature": True}
+    return {"temperature": config.indexing_temperature}
+
+
 async def _summarize_batch(
     files: list[tuple[str, str]],  # (path, content)
     llm: Any,
@@ -335,7 +345,7 @@ async def _summarize_batch(
             raw = await llm.complete(
                 messages,
                 json_mode=True,
-                temperature=0.0,
+                **_indexing_temperature_kwargs(llm),
                 max_tokens=cap,
             )
         except Exception as exc:
@@ -400,12 +410,14 @@ async def index_repo(
     run: IndexRun | None = None,
     reset: bool = False,
     platform: str = "github",
+    tree_paths: list[str] | None = None,
 ) -> int:
     """Index a full repository. Returns number of files indexed.
 
     Args:
         full: If True, re-index all files regardless of content hash.
         branch: Branch to index from.
+        tree_paths: Complete tree already fetched for the supplied branch or revision.
         cancel_check: Optional zero-arg callable returning True to request
             early termination. Checked between summarization batches. Raises
             ``IndexingCancelled`` on cancel so callers can distinguish a
@@ -440,6 +452,7 @@ async def index_repo(
                 reset=reset,
                 cancel_check=cancel_check,
                 platform=platform,
+                tree_paths=tree_paths,
             )
         _queue_vulnerability_scan(owner, repo)
         return count
@@ -462,13 +475,15 @@ async def _index_repo(
     reset: bool = False,
     cancel_check: Callable[[], bool] | None = None,
     platform: str = "github",
+    tree_paths: list[str] | None = None,
 ) -> int:
     # Auto-detect default branch if not specified
     if branch is None:
         branch = await fetcher.default_branch(owner, repo)
 
     # Fetch repo tree
-    tree_paths = await fetcher.repo_tree(owner, repo, branch)
+    if tree_paths is None:
+        tree_paths = await fetcher.repo_tree(owner, repo, branch)
     indexable = [p for p in tree_paths if _should_index(p, config.filter.exclude_patterns)]
     logger.info(
         "Found %d indexable files in %s/%s (out of %d total)",
@@ -769,7 +784,7 @@ async def _index_conventions(
 def _store_manifest_file(store: IndexStore, path: str, content: str) -> int:
     """Parse one manifest and replace its package rows. An empty parse still
     replaces, so stale entries for the path are dropped. Returns package count."""
-    packages = parse_manifest(path, content)
+    packages = parse_manifest(path, content, for_inventory=True)
     store.replace_manifest_packages(
         path,
         [
@@ -779,6 +794,7 @@ def _store_manifest_file(store: IndexStore, path: str, content: str) -> int:
                 "version": pkg.version,
                 "file_path": pkg.file_path,
                 "is_dev": pkg.is_dev,
+                "scan_eligible": pkg.scan_eligible,
             }
             for pkg in packages
         ],
@@ -894,7 +910,7 @@ async def _summarize_directories(
                 raw = await llm.complete(
                     messages,
                     json_mode=True,
-                    temperature=0.0,
+                    **_indexing_temperature_kwargs(llm),
                     max_tokens=4096,
                 )
                 data = json.loads(strip_think_blocks(_strip_code_fences(raw)))
@@ -989,8 +1005,13 @@ async def index_diff(
     *,
     run: IndexRun | None = None,
     platform: str = "github",
+    changes_only: bool = False,
 ) -> int:
-    """Incremental index for changed files. Returns number of files re-indexed."""
+    """Index a diff and return the number of files re-indexed.
+
+    With changes_only, apply changed paths under the write guard and leave
+    reconciliation pending. Use this when a complete tree is unavailable.
+    """
     if config is None:
         config = load_config()
     if llm is None:
@@ -1005,15 +1026,15 @@ async def index_diff(
 
     try:
         run = run if run is not None else store.claim_index_run()
-        with _complete_index_run(store, run):
-            if run.needs_reconciliation:
+        with nullcontext() if changes_only else _complete_index_run(store, run):
+            if run.needs_reconciliation and not changes_only:
                 logger.info("Reconciling unfinished index for %s/%s", owner, repo)
                 count = await _index_repo(
                     owner, repo, config, store, llm, fetcher, branch, run, platform=platform
                 )
                 poll = True
             else:
-                count, poll = await _index_diff(
+                count, poll, missing_count = await _index_diff(
                     owner,
                     repo,
                     config,
@@ -1023,8 +1044,15 @@ async def index_diff(
                     branch,
                     run,
                     changed_paths,
-                    removed_paths,
+                    None if changes_only else removed_paths,
                 )
+                if missing_count and not changes_only:
+                    # Manifest writes are independent of file summaries and already committed.
+                    if poll:
+                        _queue_vulnerability_scan(owner, repo)
+                    raise IndexingRecoveryPending(
+                        f"Missing content or summaries for {missing_count} changed files"
+                    )
         if poll:
             _queue_vulnerability_scan(owner, repo)
         return count
@@ -1044,7 +1072,7 @@ async def _index_diff(
     run: IndexRun,
     changed_paths: list[str] | None,
     removed_paths: list[str] | None,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, int]:
     # Remove deleted files
     if removed_paths:
         with store.index_write(run):
@@ -1066,7 +1094,7 @@ async def _index_diff(
     # Filter to indexable files
     to_index = [p for p in changed_paths or [] if _should_index(p, config.filter.exclude_patterns)]
     if not to_index:
-        return 0, bool(touched)
+        return 0, bool(touched), 0
 
     # Fetch content
     fetch_sem = asyncio.Semaphore(_FILE_FETCH_SEMAPHORE)
@@ -1077,8 +1105,10 @@ async def _index_diff(
 
     max_file_size = config.index.max_file_size
     file_pairs: list[tuple[str, str]] = []
+    unreadable: set[str] = set()
     for path, content in zip(to_index, contents, strict=False):
         if content is None:
+            unreadable.add(path)
             continue
         if max_file_size and len(content.encode("utf-8")) > max_file_size:
             continue
@@ -1087,6 +1117,7 @@ async def _index_diff(
     # Summarize changed files
     llm_sem = asyncio.Semaphore(config.index.llm_concurrency)
     indexed_count = 0
+    summarized: set[str] = set()
 
     if file_pairs:
         batches = _build_batches(file_pairs)
@@ -1101,6 +1132,7 @@ async def _index_diff(
                         summary = _build_file_summary(path, content, data)
                         store.upsert_summary(summary)
                 indexed_count += len(results)
+                summarized.update(path for path, _, _ in results)
 
     # Re-generate directory summaries for affected parent dirs
     affected_dirs: set[str] = set()
@@ -1121,7 +1153,8 @@ async def _index_diff(
         owner,
         repo,
     )
-    return indexed_count, bool(touched)
+    missing = {path for path, _ in file_pairs} - summarized
+    return indexed_count, bool(touched), len(missing | unreadable)
 
 
 async def _summarize_directories_selective(
@@ -1168,7 +1201,9 @@ async def _summarize_directories_selective(
 
         async with semaphore:
             try:
-                raw = await llm.complete(messages, json_mode=True, temperature=0.0)
+                raw = await llm.complete(
+                    messages, json_mode=True, **_indexing_temperature_kwargs(llm)
+                )
                 data = json.loads(strip_think_blocks(_strip_code_fences(raw)))
                 summary_text = data.get("summary", "")
             except Exception as exc:
