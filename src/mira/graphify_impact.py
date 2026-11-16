@@ -36,6 +36,24 @@ def _registry() -> dict:
         return {}
 
 
+def _graph_file(entry: dict) -> Path | None:
+    """Locate the graph.json for a registry entry, host paths included.
+
+    The registry stores absolute host paths (/Users/x/selfhost/graphify/graphs/…)
+    while the container mounts the same tree at /graphs: remap by cutting at the
+    '/graphify/graphs/' marker and re-rooting under GRAPHS_DIR.
+    """
+    p = str(entry.get("graph") or entry.get("graph_path") or "")
+    cands = [p] if p else []
+    marker = "/graphify/graphs/"
+    if marker in p:
+        cands.append(str(GRAPHS_DIR / p.split(marker, 1)[1].lstrip("/")))
+    for c in cands:
+        if c and Path(c).exists():
+            return Path(c)
+    return None
+
+
 def find_repo_entry(owner: str, repo: str) -> tuple[str, dict] | None:
     """Match a GitHub owner/repo against the registry's local repo_dirs.
 
@@ -56,10 +74,9 @@ def find_repo_entry(owner: str, repo: str) -> tuple[str, dict] | None:
     if len(hits) != 1:
         return None
     rd, entry = next(iter(hits.items()))
-    graph = entry.get("graph") or ""
-    if graph and Path(graph).exists():
-        return rd, entry
-    return None
+    if _graph_file(entry) is None:
+        return None
+    return rd, entry
 
 
 def has_repo(repo: str) -> bool:
@@ -84,7 +101,7 @@ def impact_for_changes(repo: str, changed_paths: list[str]) -> dict | None:
     if not hit or not changed_paths:
         return None
     rd, entry = hit
-    data = _load_graph(Path(str(entry.get("graph"))))
+    data = _load_graph(_graph_file(entry))
     if not data:
         return None
     nodes = data.get("nodes") or []
