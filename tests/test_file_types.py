@@ -32,6 +32,7 @@ def test_erlang_sources_are_indexable():
     assert language_from_path("include/dht_crawler.hrl") == Language.ERLANG.value
     assert not is_indexable_path("ebin/dht_crawler.beam")
 
+
 def test_indexability_covers_broader_platform_languages():
     for path in (
         "src/App.vue",
@@ -46,12 +47,14 @@ def test_indexability_covers_broader_platform_languages():
     ):
         assert is_indexable_path(path)
 
+
 def test_filename_detection_takes_precedence_over_extension():
     assert language_from_path("Dockerfile") == Language.DOCKERFILE.value
     assert language_from_path("Dockerfile.dev") == Language.DOCKERFILE.value
     assert language_from_path("Makefile") == Language.MAKEFILE.value
     assert language_from_path("Makefile.am") == Language.MAKEFILE.value
     assert language_from_path("CMakeLists.txt") == Language.CMAKE.value
+
 
 def test_prose_and_dotenv_files_are_not_indexed():
     assert not is_indexable_path("docs/guide.rst")

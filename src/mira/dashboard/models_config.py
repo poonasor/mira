@@ -207,14 +207,26 @@ def llm_config_for(purpose: str, base: LLMConfig, *, use_dashboard: bool = True)
             pass  # DB not available — resolve from config fields alone
 
     resolved = _resolve_for_purpose(
-        purpose, base, db_model, db_thinking, db_review, db_style,
-        db_temperature, label=purpose.capitalize()
+        purpose,
+        base,
+        db_model,
+        db_thinking,
+        db_review,
+        db_style,
+        db_temperature,
+        label=purpose.capitalize(),
     )
     if base.failover is None:
         return resolved
     failover = _resolve_for_purpose(
-        purpose, base.failover, None, None, None, None, None,
-        label=f"{purpose.capitalize()} failover"
+        purpose,
+        base.failover,
+        None,
+        None,
+        None,
+        None,
+        None,
+        label=f"{purpose.capitalize()} failover",
     )
     return resolved.model_copy(update={"failover": failover})
 
