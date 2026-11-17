@@ -1704,6 +1704,11 @@ class TestThreadResolution:
         )
         llm.review = AsyncMock(return_value=sample_llm_response_text)
         llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
+        # The agentic loop forces submit_review through complete_with_tools.
+        # An unstubbed spec method returns a mock, the review fails, and
+        # post_review is never called. Return the same canned review the
+        # non-agentic path uses.
+        llm.complete_with_tools = AsyncMock(return_value=sample_llm_response_text)
 
         config = MiraConfig()
         config.review.auto_resolve_conversations = False
