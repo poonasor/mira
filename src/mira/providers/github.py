@@ -16,8 +16,8 @@ import httpx
 from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from mira.exceptions import ProviderError
 from mira import graphify_impact
+from mira.exceptions import ProviderError
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -513,10 +513,10 @@ class GitHubProvider(BaseProvider):
         # not even fetch the PR file list (see mira.graphify_impact).
         if review_body and graphify_impact.has_repo(pr_info.repo):
             try:
-                changed_paths = await self.get_pr_files(
-                    pr_info.owner, pr_info.repo, pr_info.number)
+                changed_paths = await self.get_pr_files(pr_info.owner, pr_info.repo, pr_info.number)
                 review_body += graphify_impact.impact_section(
-                    pr_info.owner, pr_info.repo, changed_paths)
+                    pr_info.owner, pr_info.repo, changed_paths
+                )
             except Exception:  # noqa: BLE001
                 logger.debug("graphify impact annotation skipped", exc_info=True)
 

@@ -2,6 +2,8 @@ when:
   - event: push
     branch: main
   - event: pull_request
+    # 1323: dependabot PRs stay off this agent (same cut as notaryzen).
+    evaluate: 'CI_COMMIT_AUTHOR != "dependabot[bot]"'
   - event: manual
 
 # Mirrors .github/workflows/ci.yml python + ui jobs. The docker smoke job and
