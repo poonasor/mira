@@ -12,6 +12,7 @@ runner-engine routing_live.BlastCutoffs): low <= 60 nodes and <= 6
 communities, high >= 300 nodes or >= 40 communities, else medium. Override
 per deployment with GRAPHIFY_BLAST_* env vars.
 """
+
 from __future__ import annotations
 
 import json
@@ -117,8 +118,8 @@ def impact_for_changes(repo: str, changed_paths: list[str]) -> dict | None:
             file_of[nid] = sf
         comm_of[nid] = n.get("community")
     rev: dict[str, list[str]] = {}
-    for l in links:
-        rev.setdefault(str(l.get("target")), []).append(str(l.get("source")))
+    for link in links:
+        rev.setdefault(str(link.get("target")), []).append(str(link.get("source")))
 
     seeds: set[str] = set()
     for p in changed_paths or []:
@@ -126,17 +127,22 @@ def impact_for_changes(repo: str, changed_paths: list[str]) -> dict | None:
         matches = [f for f in by_file if f == pl or f.endswith("/" + pl)]
         limit = 5
         if not matches:  # a directory: every file under it, wider cap
-            matches = [f for f in by_file
-                       if f.startswith(pl + "/") or ("/" + pl + "/") in f]
+            matches = [f for f in by_file if f.startswith(pl + "/") or ("/" + pl + "/") in f]
             limit = 30
         if matches and len(matches) <= limit:
             for f in matches:
                 seeds.update(by_file[f])
 
     if not seeds:
-        return {"repo_dir": rd, "seeds": 0, "affected_nodes": None,
-                "affected_communities": None, "affected_files": None,
-                "bucket": None, "depth": DEPTH}
+        return {
+            "repo_dir": rd,
+            "seeds": 0,
+            "affected_nodes": None,
+            "affected_communities": None,
+            "affected_files": None,
+            "bucket": None,
+            "depth": DEPTH,
+        }
     frontier, seen = set(seeds), set(seeds)
     for _ in range(DEPTH):
         nxt: set[str] = set()
@@ -156,9 +162,15 @@ def impact_for_changes(repo: str, changed_paths: list[str]) -> dict | None:
         bucket = "low"
     else:
         bucket = "medium"
-    return {"repo_dir": rd, "seeds": len(seeds), "affected_nodes": n,
-            "affected_communities": c, "affected_files": len(files),
-            "bucket": bucket, "depth": DEPTH}
+    return {
+        "repo_dir": rd,
+        "seeds": len(seeds),
+        "affected_nodes": n,
+        "affected_communities": c,
+        "affected_files": len(files),
+        "bucket": bucket,
+        "depth": DEPTH,
+    }
 
 
 def impact_section(owner: str, repo: str, changed_paths: list[str]) -> str:
@@ -170,7 +182,8 @@ def impact_section(owner: str, repo: str, changed_paths: list[str]) -> str:
     if not m or m.get("bucket") is None:
         return ""
     label = {"low": "🟢 low", "medium": "🟡 medium", "high": "🔴 high"}.get(
-        str(m.get("bucket")), str(m.get("bucket")))
+        str(m.get("bucket")), str(m.get("bucket"))
+    )
     return (
         f"\n\n---\n\n**Graphify impact:** {label} — this PR is upstream of "
         f"{m['affected_nodes']} graph nodes in {m['affected_communities']} "

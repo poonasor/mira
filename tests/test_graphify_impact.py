@@ -1,4 +1,5 @@
 """Graphify impact annotations: registry matching, BFS blast, section text."""
+
 import json
 import sys
 from pathlib import Path
@@ -11,8 +12,7 @@ from mira import graphify_impact as gi  # noqa: E402
 
 
 def _write_graph(tmp_path, nodes, links):
-    data = {"directed": True, "multigraph": False, "graph": {},
-            "nodes": nodes, "links": links}
+    data = {"directed": True, "multigraph": False, "graph": {}, "nodes": nodes, "links": links}
     p = tmp_path / "graph.json"
     p.write_text(json.dumps(data))
     return p
@@ -23,14 +23,23 @@ def env(tmp_path, monkeypatch):
     """One repo registered, tiny graph: a.py -> b.py -> c.py (call chain)."""
     g = _write_graph(
         tmp_path,
-        [{"id": "a", "label": "a", "source_file": "src/a.py", "community": 1},
-         {"id": "b", "label": "b", "source_file": "src/b.py", "community": 1},
-         {"id": "c", "label": "c", "source_file": "src/c.py", "community": 2},
-         {"id": "d", "label": "d", "source_file": "src/d.py", "community": 3}],
-        [{"source": "b", "target": "a", "relation": "calls"},   # b calls a
-         {"source": "c", "target": "b", "relation": "calls"}])  # c calls b
-    reg = {"/Users/x/Development/open-seo-runner": {
-        "graph": str(g), "repo_slug": "poonasor/open-seo-runner"}}
+        [
+            {"id": "a", "label": "a", "source_file": "src/a.py", "community": 1},
+            {"id": "b", "label": "b", "source_file": "src/b.py", "community": 1},
+            {"id": "c", "label": "c", "source_file": "src/c.py", "community": 2},
+            {"id": "d", "label": "d", "source_file": "src/d.py", "community": 3},
+        ],
+        [
+            {"source": "b", "target": "a", "relation": "calls"},  # b calls a
+            {"source": "c", "target": "b", "relation": "calls"},
+        ],
+    )  # c calls b
+    reg = {
+        "/Users/x/Development/open-seo-runner": {
+            "graph": str(g),
+            "repo_slug": "poonasor/open-seo-runner",
+        }
+    }
     p = tmp_path / "registry.json"
     p.write_text(json.dumps(reg))
     monkeypatch.setattr(gi, "REGISTRY", p)
@@ -67,9 +76,18 @@ def test_section_empty_when_no_graph(tmp_path, monkeypatch):
 
 
 def test_section_marks_high(monkeypatch):
-    monkeypatch.setattr(gi, "impact_for_changes", lambda *a, **k: {
-        "repo_dir": "/r", "seeds": 3, "affected_nodes": 900,
-        "affected_communities": 90, "affected_files": 100,
-        "bucket": "high", "depth": 2})
+    monkeypatch.setattr(
+        gi,
+        "impact_for_changes",
+        lambda *a, **k: {
+            "repo_dir": "/r",
+            "seeds": 3,
+            "affected_nodes": 900,
+            "affected_communities": 90,
+            "affected_files": 100,
+            "bucket": "high",
+            "depth": 2,
+        },
+    )
     s = gi.impact_section("o", "r", ["a.py"])
     assert "Graphify impact:" in s and "high" in s and "900" in s
