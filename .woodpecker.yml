@@ -1,0 +1,26 @@
+when:
+  - event: push
+    branch: main
+  - event: pull_request
+  - event: manual
+
+# Mirrors .github/workflows/ci.yml python + ui jobs. The docker smoke job and
+# release/benchmark/evals workflows stay as they are. GitHub workflow is not replaced.
+timeout: 20
+
+steps:
+  - name: python tests
+    image: python:3.12
+    commands:
+      - pip install uv
+      - uv sync --extra dev --extra serve --extra bedrock
+      - uv run pre-commit run --all-files --show-diff-on-failure
+      - uv run pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py
+
+  - name: ui build
+    image: node:20
+    commands:
+      - cd ui/mira
+      - npm ci
+      - npx tsc --noEmit
+      - npm run build
